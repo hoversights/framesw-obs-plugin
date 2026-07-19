@@ -1,0 +1,33 @@
+[package]
+name = "framesw-obs-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Loaded directly by OBS Studio's own process as a native module — not a
+# binary, not part of the main FrameSW app's build. Deliberately its own
+# standalone Cargo project (not a workspace member of the root
+# obs_controller package): entirely different target (a shared library OBS
+# loads, not something `cargo run` ever produces), same "lives alongside
+# src/, built/packaged independently" precedent as packaging/macos/ and
+# marketing-site/.
+[lib]
+name = "framesw_obs_plugin"
+crate-type = ["cdylib"]
+
+# macOS/general logic is pure `std`/raw FFI, zero dependencies. Windows
+# needs real Win32 API bindings for `platform.rs`'s symbol-resolution
+# fallback (no RTLD_DEFAULT equivalent there) — using Microsoft's own
+# `windows-sys` crate rather than hand-declaring WinAPI signatures, same
+# "verify against real source, don't hand-port ABI-critical code" rule
+# this crate follows for libobs itself.
+[dependencies]
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+]
