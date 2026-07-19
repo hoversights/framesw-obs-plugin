@@ -124,6 +124,33 @@ fn log_line(msg: &str) {
 }
 
 // ---------------------------------------------------------------------
+// FFI panic safety: every function OBS calls into this plugin — either
+// directly (the module entry points below) or via function pointer (the
+// two callbacks it hands to `obs_enum_sources`/
+// `obs_source_add_audio_capture_callback`) — must never let a Rust panic
+// unwind across that boundary. Unwinding into the C frames on the other
+// side is undefined behavior, and in this plugin's case that's inside a
+// user's live-streaming process, not a sandbox. `catch_unwind` turns any
+// panic into an `Err` here instead, logged via the existing `log_line`
+// path, with the entry point returning its safe "did nothing" value to
+// OBS exactly as if this call had never been made — never propagated,
+// never aborted.
+fn ffi_guard<R>(entry_point: &str, fallback: R, f: impl FnOnce() -> R + std::panic::UnwindSafe) -> R {
+    match std::panic::catch_unwind(f) {
+        Ok(value) => value,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            log_line(&format!("PANIC caught at FFI boundary in {entry_point} — {msg}"));
+            fallback
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Attach an audio capture callback to every source we can find; each
 // callback updates a shared map (not a direct log/emit — that's far too
 // often to usefully log or send over the wire) that a separate,
@@ -157,6 +184,19 @@ static THREADS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new())
 static LEVELS: Mutex<Option<HashMap<String, (f32, bool)>>> = Mutex::new(None);
 
 extern "C" fn audio_capture_callback(
+    param: *mut c_void,
+    source: *mut ObsSourceT,
+    audio_data: *const AudioData,
+    muted: bool,
+) {
+    ffi_guard(
+        "audio_capture_callback",
+        (),
+        std::panic::AssertUnwindSafe(|| audio_capture_callback_impl(param, source, audio_data, muted)),
+    );
+}
+
+fn audio_capture_callback_impl(
     _param: *mut c_void,
     source: *mut ObsSourceT,
     audio_data: *const AudioData,
@@ -211,7 +251,18 @@ extern "C" fn audio_capture_callback(
     }
 }
 
-extern "C" fn attach_callback_enum_proc(_param: *mut c_void, source: *mut ObsSourceT) -> bool {
+extern "C" fn attach_callback_enum_proc(param: *mut c_void, source: *mut ObsSourceT) -> bool {
+    // Fallback `false` on a caught panic: stop this enumeration pass early
+    // rather than risk repeating whatever triggered it against the rest
+    // of the sources — the next 5s rescan tries again from scratch.
+    ffi_guard(
+        "attach_callback_enum_proc",
+        false,
+        std::panic::AssertUnwindSafe(|| attach_callback_enum_proc_impl(param, source)),
+    )
+}
+
+fn attach_callback_enum_proc_impl(_param: *mut c_void, source: *mut ObsSourceT) -> bool {
     // Remove-then-add: net exactly one list entry per source per cycle
     // (see the resolved_fn comment on remove — libobs's add never dedups).
     if let Some(remove) = obs_source_remove_audio_capture_callback() {
@@ -376,18 +427,26 @@ static mut MODULE_POINTER: *mut ObsModuleT = std::ptr::null_mut();
 
 #[no_mangle]
 pub extern "C" fn obs_module_set_pointer(module: *mut ObsModuleT) {
-    unsafe {
-        MODULE_POINTER = module;
-    }
+    ffi_guard(
+        "obs_module_set_pointer",
+        (),
+        std::panic::AssertUnwindSafe(|| unsafe {
+            MODULE_POINTER = module;
+        }),
+    );
 }
 
 #[no_mangle]
 pub extern "C" fn obs_current_module() -> *mut ObsModuleT {
-    unsafe { MODULE_POINTER }
+    ffi_guard("obs_current_module", std::ptr::null_mut(), || unsafe { MODULE_POINTER })
 }
 
 #[no_mangle]
 pub extern "C" fn obs_module_ver() -> u32 {
+    ffi_guard("obs_module_ver", 30u32 << 24, obs_module_ver_impl)
+}
+
+fn obs_module_ver_impl() -> u32 {
     // MAKE_SEMANTIC_VERSION(30, 0, 0) — deliberately conservative, *not*
     // whatever obs-studio@master currently reports. Live-tested: claiming
     // 32.2.0 (master's current LIBOBS_API_VER, at the time this was first
@@ -406,9 +465,11 @@ pub extern "C" fn obs_module_ver() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn obs_module_load() -> bool {
-    log_line("loaded — watching for audio on Preview-only sources");
-    spawn_periodic_rescan();
-    true
+    ffi_guard("obs_module_load", false, || {
+        log_line("loaded — watching for audio on Preview-only sources");
+        spawn_periodic_rescan();
+        true
+    })
 }
 
 /// Called once, after every module (including obs-websocket, if
@@ -418,14 +479,16 @@ pub extern "C" fn obs_module_load() -> bool {
 /// in.
 #[no_mangle]
 pub extern "C" fn obs_module_post_load() {
-    let vendor = calldata::register_vendor("framesw");
-    if vendor.is_null() {
-        log_line("obs-websocket not installed/loaded — audio levels will only reach OBS's own log, not FrameSW");
-        return;
-    }
-    VENDOR.store(vendor, Ordering::Release);
-    log_line("registered as obs-websocket vendor \"framesw\" — forwarding audio levels");
-    spawn_emit_loop();
+    ffi_guard("obs_module_post_load", (), || {
+        let vendor = calldata::register_vendor("framesw");
+        if vendor.is_null() {
+            log_line("obs-websocket not installed/loaded — audio levels will only reach OBS's own log, not FrameSW");
+            return;
+        }
+        VENDOR.store(vendor, Ordering::Release);
+        log_line("registered as obs-websocket vendor \"framesw\" — forwarding audio levels");
+        spawn_emit_loop();
+    })
 }
 
 /// `libobs/obs-module.h`'s counterpart to `obs_module_load` — OBS calls
@@ -439,13 +502,15 @@ pub extern "C" fn obs_module_post_load() {
 /// until both threads have actually exited, not just been asked to.
 #[no_mangle]
 pub extern "C" fn obs_module_unload() {
-    SHUTTING_DOWN.store(true, Ordering::Release);
-    let handles: Vec<std::thread::JoinHandle<()>> = match THREADS.lock() {
-        Ok(mut threads) => threads.drain(..).collect(),
-        Err(_) => Vec::new(),
-    };
-    for handle in handles {
-        let _ = handle.join();
-    }
-    log_line("unloaded — background threads stopped cleanly");
+    ffi_guard("obs_module_unload", (), || {
+        SHUTTING_DOWN.store(true, Ordering::Release);
+        let handles: Vec<std::thread::JoinHandle<()>> = match THREADS.lock() {
+            Ok(mut threads) => threads.drain(..).collect(),
+            Err(_) => Vec::new(),
+        };
+        for handle in handles {
+            let _ = handle.join();
+        }
+        log_line("unloaded — background threads stopped cleanly");
+    })
 }
