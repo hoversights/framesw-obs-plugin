@@ -259,6 +259,47 @@ pub fn vendor_emit_event(vendor: *mut c_void, event_name: &str, event_data: *mut
     vendor_run_simple_proc(vendor, "vendor_event_emit", &mut cd)
 }
 
+/// `obs-websocket-api.h`'s vendor request callback signature:
+/// `typedef void (*obs_websocket_request_callback_function)(obs_data_t *, obs_data_t *, void *);`
+/// (request_data, response_data, priv_data) — kept as `*mut c_void` here
+/// since this module doesn't know about `obs_data.rs`'s `ObsDataT` type,
+/// the same opaque-handoff shape `vendor_emit_event`'s own `event_data`
+/// parameter already uses; the real callback in `lib.rs` casts to
+/// `ObsDataT` internally. No return value: the callback populates
+/// `response_data` (already allocated by obs-websocket) in place.
+pub type RequestCallbackFn = extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+
+/// `obs-websocket-api.h`:
+/// ```c
+/// struct obs_websocket_request_callback {
+///     obs_websocket_request_callback_function callback;
+///     void *priv_data;
+/// };
+/// ```
+/// Field order/types verbatim — passed by pointer (`&cb`) below, exactly
+/// like `obs_websocket_register_event_callback`'s own local `cb`;
+/// obs-websocket must copy this out internally before
+/// `vendor_request_register` returns, since `cb` is a stack local that
+/// goes out of scope immediately after this function does.
+#[repr(C)]
+struct RequestCallback {
+    callback: RequestCallbackFn,
+    priv_data: *mut c_void,
+}
+
+/// `obs_websocket_vendor_register_request`. `priv_data` is always null
+/// here — this plugin has no per-registration state to thread through;
+/// the callback reaches everything it needs via its own module statics,
+/// same as every other libobs callback in this crate
+/// (`audio_capture_callback` etc.).
+pub fn register_request(vendor: *mut c_void, request_type: &str, callback: RequestCallbackFn) -> bool {
+    let mut cb = RequestCallback { callback, priv_data: std::ptr::null_mut() };
+    let mut cd = CallData::zeroed();
+    calldata_set_string(&mut cd, "type", request_type);
+    calldata_set_ptr(&mut cd, "callback", (&mut cb as *mut RequestCallback).cast());
+    vendor_run_simple_proc(vendor, "vendor_request_register", &mut cd)
+}
+
 #[allow(dead_code)]
 pub fn cstr_lossy(ptr: *const c_char) -> String {
     if ptr.is_null() {

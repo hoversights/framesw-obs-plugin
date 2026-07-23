@@ -21,6 +21,9 @@ crate::resolved_fn!(obs_data_set_array: extern "C" fn(*mut ObsDataT, *const c_ch
 crate::resolved_fn!(obs_data_array_create: extern "C" fn() -> *mut ObsDataArrayT);
 crate::resolved_fn!(obs_data_array_release: extern "C" fn(*mut ObsDataArrayT));
 crate::resolved_fn!(obs_data_array_push_back: extern "C" fn(*mut ObsDataArrayT, *mut ObsDataT) -> usize);
+// `libobs/obs-data.h`: "Gets string, defaults to "" if it does not exist
+// or is not a string."  Signature: `const char *obs_data_get_string(obs_data_t *data, const char *name);`
+crate::resolved_fn!(obs_data_get_string: extern "C" fn(*mut ObsDataT, *const c_char) -> *const c_char);
 
 fn cstr(s: &str) -> CString {
     CString::new(s).unwrap_or_else(|e| {
@@ -114,4 +117,58 @@ pub fn release(data: *mut ObsDataT) {
 // know about `obs_data.rs`'s types.
 pub fn as_void(data: *mut ObsDataT) -> *mut c_void {
     data.cast()
+}
+
+/// Reverse of `as_void` — for `lib.rs`'s request-callback trampoline,
+/// which receives the `request_data`/`response_data` pair from
+/// `calldata.rs`'s `RequestCallbackFn` as opaque `*mut c_void` (that
+/// module doesn't know about `ObsDataT`) and needs them back as typed
+/// pointers to call anything in this module.
+pub fn from_void(ptr: *mut c_void) -> *mut ObsDataT {
+    ptr.cast()
+}
+
+/// `obs_data_get_string`, defaulting to `""` (never null on a successful
+/// call — that's the real function's own documented default) if the key
+/// is absent or `data` is null; `None` only if the `obs_data_get_string`
+/// symbol itself couldn't be resolved.
+pub fn get_string(data: *mut ObsDataT, key: &str) -> Option<String> {
+    let obs_data_get_string = self::obs_data_get_string()?;
+    if data.is_null() {
+        return Some(String::new());
+    }
+    let key = cstr(key);
+    let ptr = obs_data_get_string(data, key.as_ptr());
+    if ptr.is_null() {
+        return Some(String::new());
+    }
+    Some(unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+}
+
+/// `obs_data_set_string`, silently a no-op if `data` is null or the
+/// symbol can't be resolved — used only for building this plugin's own
+/// response payloads, where "couldn't set a field" degrades to "the
+/// field is just absent," never a crash.
+pub fn set_string(data: *mut ObsDataT, key: &str, value: &str) {
+    let Some(obs_data_set_string) = self::obs_data_set_string() else {
+        return;
+    };
+    if data.is_null() {
+        return;
+    }
+    let key = cstr(key);
+    let value = cstr(value);
+    obs_data_set_string(data, key.as_ptr(), value.as_ptr());
+}
+
+/// `obs_data_set_bool`, same no-op-on-failure shape as `set_string`.
+pub fn set_bool(data: *mut ObsDataT, key: &str, value: bool) {
+    let Some(obs_data_set_bool) = self::obs_data_set_bool() else {
+        return;
+    };
+    if data.is_null() {
+        return;
+    }
+    let key = cstr(key);
+    obs_data_set_bool(data, key.as_ptr(), value);
 }
