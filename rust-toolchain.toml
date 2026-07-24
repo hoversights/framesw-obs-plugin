@@ -1,0 +1,8 @@
+[toolchain]
+# Pinned so CI (and every dev machine) builds against the exact same
+# compiler — no "works on my machine" drift from a floating `stable`.
+# Bump deliberately, not automatically. Cross-compile targets for the
+# macOS universal build are added explicitly in the CI workflow instead
+# of listed here, so a Windows checkout doesn't also try to pull down
+# unrelated macOS target components.
+channel = "1.95.0"

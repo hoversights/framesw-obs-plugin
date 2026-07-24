@@ -87,8 +87,21 @@ EOF
 # Gatekeeper-quarantined the way a downloaded file is, but signing it
 # anyway matches how the already-installed real plugins on this machine
 # are set up). Release mode signs with the real Developer ID identity
-# instead, so it survives being bundled into a notarized FrameSW.app.
-codesign --force --sign "$SIGN_IDENTITY" "$BUNDLE/Contents/MacOS/framesw-companion"
+# instead, so it survives being bundled into a notarized FrameSW.app —
+# `--options runtime --timestamp` (hardened runtime + a real Apple
+# secure timestamp) only in that mode: this binary can never hold its
+# own stapled notarization ticket (no `stapler staple` target for a
+# bare dylib/bundle without an Info.plist executable entry point), it
+# rides the app bundle's notarization once FrameSW.app itself is
+# notarized — but that only accepts a nested binary whose own signature
+# is already notarization-ready, which requires both flags. Omitted in
+# ad-hoc dev mode: meaningless without a real Developer ID identity, and
+# unnecessary for a local test install.
+if [ "$RELEASE_MODE" = "1" ]; then
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$BUNDLE/Contents/MacOS/framesw-companion"
+else
+    codesign --force --sign "$SIGN_IDENTITY" "$BUNDLE/Contents/MacOS/framesw-companion"
+fi
 
 echo ""
 echo "Built: $BUNDLE"

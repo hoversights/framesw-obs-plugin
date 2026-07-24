@@ -1,0 +1,178 @@
+name: Build
+
+# Push-only, deliberately. NEVER add `pull_request`/`pull_request_target`
+# here: this is a public repo, and those triggers run workflow code
+# against whatever a fork's PR branch contains. That's fine on a
+# GitHub-hosted runner (each run is a throwaway VM), but it's a standing
+# invitation for a malicious PR to exfiltrate this job's secrets
+# (the Developer ID cert + its password) the moment anyone adds a
+# secrets-consuming step to a fork-triggered workflow. Keep signing and
+# `pull_request` permanently separated in this repo.
+on:
+  push:
+
+# Least-privilege default: this workflow only builds and uploads
+# artifacts, never writes back to the repo or opens anything.
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Toolchain version comes from rust-toolchain.toml (repo root) —
+      # rustup resolves and installs it automatically on the first
+      # cargo/rustup invocation below, no separate install action
+      # needed. Cross targets are explicit here (not in the toolchain
+      # file) so a Windows checkout of this same file never tries to
+      # pull macOS target components.
+      - name: Add macOS cross-compile targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      # Zero unit tests exist in this crate today (verified — no #[test]
+      # anywhere in src/). This step is wired up anyway so tests added
+      # later run automatically; it's a no-op until then. This does NOT
+      # exercise `group.rs`'s `manage_group` vendor-request spike
+      # (fbd8c43) — that code path only ever runs inside a live OBS
+      # process that calls it over obs-websocket, and nothing here can
+      # or should simulate that. Do not add an integration test that
+      # tries to spin up real OBS in CI for this.
+      - name: Run unit tests
+        run: cargo test --locked --target aarch64-apple-darwin
+
+      # Imports the Developer ID Application cert into a throwaway
+      # keychain scoped to this job, following Apple's own documented
+      # CI pattern (create -> unlock -> import -> allow codesign to use
+      # it without a GUI prompt via set-key-partition-list). The
+      # keychain and the decoded .p12 are both deleted unconditionally
+      # in the last step (`if: always()`), including on failure, so a
+      # cancelled or failed run never leaves signing material sitting on
+      # the (ephemeral, but still) runner's disk.
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/developer_id.p12"
+
+          echo "$MACOS_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 1800 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PWD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          # Append to the existing search list rather than hardcoding
+          # "login.keychain" — the exact default keychain name/path
+          # varies across runner images (some ship login.keychain-db).
+          EXISTING_KEYCHAINS=$(security list-keychains -d user | sed 's/[\"[:space:]]//g')
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $EXISTING_KEYCHAINS
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+          SIGN_IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.*)"/\1/')
+          if [ -z "$SIGN_IDENTITY" ]; then
+            echo "No Developer ID Application identity found in the imported certificate." >&2
+            exit 1
+          fi
+          echo "SIGN_IDENTITY=$SIGN_IDENTITY" >> "$GITHUB_ENV"
+
+      # `--release` builds the universal (arm64 + x86_64) binary and
+      # signs it with hardened runtime + a secure timestamp — see
+      # package-macos.sh's own comment on why: this binary can never
+      # hold its own stapled notarization ticket (no `stapler staple`
+      # target for a bare bundle without an executable Info.plist entry
+      # point), it rides FrameSW.app's notarization once bundled there,
+      # and that only accepts a nested binary whose signature is already
+      # notarization-ready.
+      - name: Build and sign universal plugin
+        run: ./package-macos.sh --release "$SIGN_IDENTITY"
+
+      - name: Verify signature
+        run: |
+          set -euo pipefail
+          BIN="target/framesw-companion.plugin/Contents/MacOS/framesw-companion"
+          codesign -vvv --deep --strict "$BIN"
+          codesign -dvvv "$BIN"
+          echo "--- architectures ---"
+          lipo -info "$BIN"
+
+      - name: Package artifact
+        id: package
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          SHA="${GITHUB_SHA:0:7}"
+          NAME="framesw-companion-${VERSION}-${SHA}-macos"
+          (cd target && zip -r "../${NAME}.zip" framesw-companion.plugin)
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.name }}.zip
+          if-no-files-found: error
+          # Explicit, not the (also 90-day) default — see CI.md for the
+          # expiry/handoff implications for the app repo's fetch step.
+          retention-days: 90
+
+      # Runs even if an earlier step failed, so a signing failure never
+      # leaves the imported cert sitting in a keychain on disk.
+      - name: Delete temporary keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # See the macOS job's identical comment — toolchain version comes
+      # from rust-toolchain.toml; windows-latest's host target
+      # (x86_64-pc-windows-msvc) is already what package-windows.ps1
+      # builds for, no extra `rustup target add` needed here.
+      - name: Run unit tests
+        run: cargo test --locked
+
+      - name: Build plugin DLL
+        run: powershell -NoProfile -File package-windows.ps1
+
+      # Deliberately empty — do NOT implement Windows signing yet, Azure
+      # Trusted Signing is still pending (see PROJECT_OVERVIEW.md /
+      # CLAUDE.md in the app repo). Once a real cert/config exists,
+      # replace this step's body with the actual signing invocation
+      # (matching whatever the app repo's package-windows.ps1 lands on
+      # for its own -AzureSign path) — no other workflow changes should
+      # be needed, the artifact step below already just zips whatever
+      # package-windows.ps1 produced.
+      - name: Sign (pending Azure Trusted Signing)
+        run: |
+          # TODO(Azure Trusted Signing): once the cert/credentials exist,
+          # sign target\framesw-companion\bin\64bit\framesw-companion.dll
+          # here. Tracked as pending in CLAUDE.md; do not block on it.
+          Write-Host "Windows signing not yet implemented - Azure Trusted Signing is still pending. Artifact below is UNSIGNED."
+
+      - name: Package artifact
+        id: package
+        run: |
+          $Version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+          $Sha = $env:GITHUB_SHA.Substring(0, 7)
+          $Name = "framesw-companion-$Version-$Sha-windows"
+          Compress-Archive -Path target\framesw-companion -DestinationPath "$Name.zip"
+          "name=$Name" >> $env:GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.name }}.zip
+          if-no-files-found: error
+          retention-days: 90
