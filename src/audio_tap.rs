@@ -152,13 +152,21 @@ pub fn stop_all() {
 // backs "no layer soloed, monitor the whole Preview mix."
 // ---------------------------------------------------------------------
 
-/// How often the mix flush thread sums and sends a combined frame.
-/// Matches the ballpark of a typical OBS audio callback cadence (roughly
-/// one ~480-sample chunk per ~10ms at 48kHz) closely enough that a
-/// contributing source's *latest* buffer is rarely more than one flush
-/// cycle stale — good enough for local monitoring, not a broadcast-grade
-/// synchronized mixer.
-const MIX_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
+/// How often the mix flush thread checks for newly-queued audio and
+/// sends whatever's accumulated since the last check. Deliberately *not*
+/// paired with a fixed, precomputed frames-per-flush count — an earlier
+/// version assumed `sample_rate * MIX_FLUSH_INTERVAL` frames would always
+/// be available and popped exactly that many every cycle, which drifted
+/// against OBS's own real audio-callback timing (`std::thread::sleep`
+/// is a minimum, not an exact clock) and periodically padded with
+/// silence or discarded real queued audio to force that fixed count —
+/// live-reported, 2026-07-24: a single-contributor mix (nothing else to
+/// even sum against) still sounded distorted, while Solo — which never
+/// resamples/re-chunks at all — played the identical source cleanly.
+/// This interval now only controls latency/poll granularity; the actual
+/// frame count sent each cycle is always however many samples really
+/// are queued (see `drain_and_sum`), so there's nothing to drift against.
+const MIX_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
 
 struct MixBus {
     sender: NdiSender,
@@ -299,76 +307,87 @@ fn spawn_mix_flush_thread(bus: Arc<MixBus>) -> std::thread::JoinHandle<()> {
             if sample_rate <= 0 || channels <= 0 {
                 continue;
             }
-            let frames_per_flush =
-                ((sample_rate as f64) * MIX_FLUSH_INTERVAL.as_secs_f64()).round() as usize;
-            if frames_per_flush == 0 {
-                continue;
-            }
             let channels = channels as usize;
             let mixed = {
                 let Ok(mut queues) = bus.queues.lock() else {
                     continue;
                 };
-                drain_and_sum(&mut queues, channels, frames_per_flush)
+                drain_and_sum(&mut queues, channels)
             };
             let Some(mut mixed) = mixed else {
                 continue;
             };
-            bus.sender.send_audio(sample_rate, channels as i32, frames_per_flush as i32, &mut mixed);
+            let frames = mixed.len() / channels;
+            bus.sender.send_audio(sample_rate, channels as i32, frames as i32, &mut mixed);
         }
     })
 }
 
-/// Pops exactly `frames_per_flush` samples per channel from each
-/// contributing source's FIFO queues (silence-padding a source that
-/// hasn't delivered enough yet this cycle — real underrun, e.g. it just
-/// joined the mix, not a bug; the alternative, blocking for more data,
-/// would stall every *other* contributor's audio too) and sums them into
-/// one combined planar buffer. A source whose queue count doesn't match
-/// `channels` is skipped entirely (defensive guard — channel count is
-/// one global OBS setting shared by every source, so this isn't an
-/// expected path, just cheap insurance against ever indexing out of
-/// bounds). `None` if nothing in the map has the right channel count to
-/// contribute at all this cycle.
+/// Pops however many samples per channel are *actually* queued right now
+/// — the shortest currently-available length among contributing sources
+/// (so nothing waits on, or is padded on behalf of, a source that just
+/// joined and hasn't pushed its first chunk yet) — and sums them into one
+/// combined planar buffer, real-time-driven rather than assuming a fixed
+/// rate. A source whose queue count doesn't match `channels` is skipped
+/// entirely (defensive guard — channel count is one global OBS setting
+/// shared by every source, so this isn't an expected path, just cheap
+/// insurance against ever indexing out of bounds). `None` if nothing in
+/// the map has the right channel count to contribute, or the shortest
+/// available length is zero.
 ///
 /// Split out from the flush thread's own loop so this — the actual
-/// mixing arithmetic, and the fix for "one layer plays clean, another
-/// stutters" — is unit-testable without a real thread, NDI sender, or
-/// bus registry.
-fn drain_and_sum(
-    queues: &mut HashMap<String, Vec<VecDeque<f32>>>,
-    channels: usize,
-    frames_per_flush: usize,
-) -> Option<Vec<f32>> {
-    let mut mixed = vec![0.0f32; frames_per_flush * channels];
+/// mixing arithmetic, and the fix for both the earlier "one layer plays
+/// clean, another stutters" bug and a later "even a single layer sounds
+/// distorted" one (a fixed assumed frames-per-flush count drifting
+/// against OBS's own real audio-callback timing, since
+/// `std::thread::sleep` is a minimum, not an exact clock) — is unit
+/// testable without a real thread, NDI sender, or bus registry.
+fn drain_and_sum(queues: &mut HashMap<String, Vec<VecDeque<f32>>>, channels: usize) -> Option<Vec<f32>> {
+    let mut frames = usize::MAX;
     let mut contributor_count = 0usize;
-    for per_channel in queues.values_mut() {
+    for per_channel in queues.values() {
         if per_channel.len() != channels {
             continue;
         }
         contributor_count += 1;
+        let available = per_channel.first().map_or(0, VecDeque::len);
+        frames = frames.min(available);
+    }
+    if contributor_count == 0 || frames == 0 || frames == usize::MAX {
+        return None;
+    }
+    let mut mixed = vec![0.0f32; frames * channels];
+    for per_channel in queues.values_mut() {
+        if per_channel.len() != channels {
+            continue;
+        }
         for (ch, queue) in per_channel.iter_mut().enumerate() {
-            for i in 0..frames_per_flush {
+            for i in 0..frames {
+                // `unwrap_or(0.0)` here is unreachable in practice (every
+                // contributor's queue is already known to hold at least
+                // `frames` samples, the minimum computed above) — kept
+                // only so a channel whose queue was somehow shorter than
+                // its sibling channels (shouldn't happen; every push
+                // extends all channels together) degrades to silence for
+                // its own tail instead of panicking.
                 let sample = queue.pop_front().unwrap_or(0.0);
-                mixed[ch * frames_per_flush + i] += sample;
+                mixed[ch * frames + i] += sample;
             }
         }
-    }
-    if contributor_count == 0 {
-        return None;
     }
     // Headroom: divide by how many sources actually contributed *this
     // cycle*, not a fixed constant — two normal, near-unity sources
     // summed raw easily doubles peak amplitude, which is exactly what
-    // live-reported "distorted" audio sounded like (harsh clipping, not
-    // stuttering — a different bug from the underrun/repeat one above).
-    // A single contributor plays at its own unattenuated level (nothing
-    // to clash with); each of N contributors effectively drops to 1/N so
-    // the sum can't exceed unity as long as no individual source already
-    // does. The final `clamp` is defense in depth for the case where one
-    // does (upstream gain/filters pushing a source past 0dBFS on its
-    // own) — never let a monitor-only mix send a value NDI/the receiving
-    // device would have to clip unpredictably.
+    // live-reported "distorted" audio sounded like (harsh clipping, a
+    // different bug from the drift one above — both happened to share
+    // the word "distorted" in separate live reports). A single
+    // contributor plays at its own unattenuated level (nothing to clash
+    // with); each of N contributors effectively drops to 1/N so the sum
+    // can't exceed unity as long as no individual source already does.
+    // The final `clamp` is defense in depth for the case where one does
+    // (upstream gain/filters pushing a source past 0dBFS on its own) —
+    // never let a monitor-only mix send a value NDI/the receiving device
+    // would have to clip unpredictably.
     let gain = 1.0 / contributor_count as f32;
     for sample in &mut mixed {
         *sample = (*sample * gain).clamp(-1.0, 1.0);
@@ -617,7 +636,7 @@ mod tests {
             ("a", &[&[1.0f32, 0.5, -0.5]]),
             ("b", &[&[0.2f32, 0.2, 0.2]]),
         ]);
-        let mixed = drain_and_sum(&mut queues, 1, 3).expect("two real contributors");
+        let mixed = drain_and_sum(&mut queues, 1).expect("two real contributors");
         // Raw sum would be [1.2, 0.7, -0.3] — halved (two contributors)
         // to leave headroom, the actual fix for live-reported distortion
         // (two normal-level sources summed raw clipping hard).
@@ -629,7 +648,7 @@ mod tests {
         // No headroom penalty when there's nothing else to clash with —
         // only N > 1 contributors should ever get attenuated.
         let mut queues = queues_from(&[("a", &[&[0.8f32, -0.8]])]);
-        let mixed = drain_and_sum(&mut queues, 1, 2).expect("one contributor");
+        let mixed = drain_and_sum(&mut queues, 1).expect("one contributor");
         assert_eq!(mixed, vec![0.8, -0.8]);
     }
 
@@ -642,30 +661,35 @@ mod tests {
         // something further out of range than a single hot source
         // already was.
         let mut queues = queues_from(&[("a", &[&[1.5f32, -1.5]])]);
-        let mixed = drain_and_sum(&mut queues, 1, 2).expect("one (hot) contributor");
+        let mixed = drain_and_sum(&mut queues, 1).expect("one (hot) contributor");
         assert_eq!(mixed, vec![1.0, -1.0]);
     }
 
     #[test]
-    fn drain_and_sum_pads_a_source_that_underran_with_silence_not_a_repeat() {
-        // The actual bug being fixed: a source delivering less than one
-        // flush cycle's worth of samples must contribute silence for the
-        // remainder, never its last values repeated — that repetition is
-        // exactly what a "keep only the latest chunk" design produced
-        // (live-reported stutter on one of two mixed layers).
+    fn drain_and_sum_syncs_to_the_slowest_contributor_leaving_the_rest_queued() {
+        // The actual fix for "even a single layer sounds distorted": no
+        // fixed assumed frame count, no silence-padding for a source
+        // that's momentarily behind — this cycle only consumes what
+        // *every* contributor can actually supply, and a faster
+        // contributor's remaining samples stay queued for the next
+        // cycle rather than being dropped or fabricated.
         let mut queues = queues_from(&[
             ("a", &[&[1.0f32, 1.0, 1.0, 1.0]]),
-            ("b", &[&[0.5f32, 0.5]]), // only 2 of this cycle's 4 frames available
+            ("b", &[&[0.5f32, 0.5]]), // only 2 samples available right now
         ]);
-        let mixed = drain_and_sum(&mut queues, 1, 4).expect("still a real contributor");
-        // Raw sum [1.5, 1.5, 1.0, 1.0], halved for headroom (2 contributors).
-        assert_eq!(mixed, vec![0.75, 0.75, 0.5, 0.5]);
+        let mixed = drain_and_sum(&mut queues, 1).expect("still a real contributor");
+        // Only 2 frames this cycle (the shorter of the two) — raw sum
+        // [1.5, 1.5], halved for headroom (2 contributors).
+        assert_eq!(mixed, vec![0.75, 0.75]);
+        // "a"'s remaining 2 samples are still queued, untouched, for
+        // whenever "b" (or the next flush) catches up — never lost.
+        assert_eq!(queues["a"][0], VecDeque::from(vec![1.0, 1.0]));
     }
 
     #[test]
     fn drain_and_sum_handles_multiple_channels_independently() {
         let mut queues = queues_from(&[("a", &[&[1.0f32, 1.0], &[-1.0f32, -1.0]])]);
-        let mixed = drain_and_sum(&mut queues, 2, 2).expect("one contributor, two channels");
+        let mixed = drain_and_sum(&mut queues, 2).expect("one contributor, two channels");
         // Planar layout: channel 0's frames, then channel 1's. One
         // contributor, so no headroom attenuation.
         assert_eq!(mixed, vec![1.0, 1.0, -1.0, -1.0]);
@@ -677,13 +701,23 @@ mod tests {
         // so this isn't expected in practice, but must never panic/index
         // out of bounds if it somehow happened.
         let mut queues = queues_from(&[("mono-in-a-stereo-mix", &[&[1.0f32, 1.0]])]);
-        assert_eq!(drain_and_sum(&mut queues, 2, 2), None);
+        assert_eq!(drain_and_sum(&mut queues, 2), None);
     }
 
     #[test]
     fn drain_and_sum_is_none_when_nothing_contributed() {
         let mut queues = HashMap::new();
-        assert_eq!(drain_and_sum(&mut queues, 2, 480), None);
+        assert_eq!(drain_and_sum(&mut queues, 2), None);
+    }
+
+    #[test]
+    fn drain_and_sum_is_none_when_a_contributor_has_nothing_queued_yet() {
+        // A source that's in the mix (`set_mix_sources` already ran) but
+        // hasn't had its first callback fire yet — an empty queue, not a
+        // missing one — must not produce a bogus zero-length "contributed"
+        // result.
+        let mut queues = queues_from(&[("a", &[&[]])]);
+        assert_eq!(drain_and_sum(&mut queues, 1), None);
     }
 
     #[test]
