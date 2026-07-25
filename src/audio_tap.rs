@@ -27,7 +27,7 @@
 //!   from the same individual per-source taps that already work,
 //!   instead of tapping the scene directly.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -107,11 +107,7 @@ pub fn start_audio_tap(source_name: &str, bus_id: &str) -> Result<(), String> {
         }
         StartDecision::NeedsNewSender => {
             let ndi_name = format!("FrameSW-Monitor-{bus_id}");
-            let Some(sender) = NdiSender::new(&ndi_name) else {
-                return Err(format!(
-                    "NDI runtime unavailable — could not create sender '{ndi_name}'"
-                ));
-            };
+            let sender = NdiSender::new(&ndi_name).map_err(|e| format!("'{ndi_name}': {e}"))?;
             taps.insert(bus_id.to_string(), Tap { source_name: source_name.to_string(), sender });
             Ok(())
         }
@@ -166,17 +162,21 @@ const MIX_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
 
 struct MixBus {
     sender: NdiSender,
-    /// source_name -> that source's most recent post-volume planar
-    /// buffer (already scaled and rearranged into contiguous per-channel
-    /// runs — same shape `build_scaled_planar_buffer` produces),
-    /// overwritten — never accumulated — on every matching callback.
-    /// Independent sources fire at independent, uncoordinated times, so
-    /// summing has to happen on its own fixed cadence (the flush
-    /// thread), not per-callback.
-    latest: Mutex<HashMap<String, Vec<f32>>>,
+    /// source_name -> that source's per-channel FIFO queues of scaled
+    /// samples (`build_scaled_planar_buffer`'s per-channel slices,
+    /// pushed on every matching callback via `extend`). A real queue,
+    /// not "keep only the latest chunk": independent sources fire at
+    /// independent, uncoordinated times, so a fixed-cadence flush
+    /// popping a *specific* frame count per cycle is what avoids
+    /// silently dropping samples between callbacks (too fast) or
+    /// resending the same ones (too slow) — live-reported, 2026-07-24:
+    /// the "latest chunk overwritten" version of this played one
+    /// contributing layer clean and another stuttering, exactly the
+    /// symptom of that mismatch.
+    queues: Mutex<HashMap<String, Vec<VecDeque<f32>>>>,
     /// Which sources currently belong to this bus's mix — read by
-    /// `forward_if_tapped` to decide whether to update `latest`,
-    /// written by `set_mix_sources`.
+    /// `forward_if_tapped` to decide whether to queue, written by
+    /// `set_mix_sources`.
     sources: Mutex<HashSet<String>>,
     /// Most recently observed `(sample_rate, channels)` — shared by
     /// every contributor in practice, since all of OBS's audio callbacks
@@ -185,6 +185,17 @@ struct MixBus {
     /// sends with whatever's actually current.
     meta: Mutex<(i32, i32)>,
     running: Arc<AtomicBool>,
+    /// Set right after `spawn_mix_flush_thread` returns, taken and
+    /// joined by `stop_mix_bus` — without this, tearing down a mix bus
+    /// only *asked* its flush thread to stop and returned immediately,
+    /// so a same-`bus_id` `start_audio_tap` right after (Solo engaging)
+    /// could race `NDIlib_send_create` against the old sender's own
+    /// `NDIlib_send_destroy`, which only runs once the flush thread's own
+    /// `Arc<MixBus>` clone actually drops. Live-reported, 2026-07-24:
+    /// every attempt to Solo right after the combined mix had been
+    /// playing failed with "NDI runtime unavailable" — the runtime was
+    /// fine; `send_create` was failing on the still-live duplicate name.
+    thread_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// bus_id -> its active mix bus, if any.
@@ -193,15 +204,15 @@ static MIX_BUSES: Mutex<Option<HashMap<String, Arc<MixBus>>>> = Mutex::new(None)
 /// Replaces which sources contribute to `bus_id`'s combined mix. Safe to
 /// call repeatedly, including with the same set (a no-op beyond updating
 /// bookkeeping) or a changed set (sources no longer listed stop
-/// contributing from this call on — their last-known buffer is dropped
-/// immediately, not left to keep being summed as stale phantom audio).
+/// contributing from this call on — their queued audio is dropped
+/// immediately, not left to keep draining as stale phantom audio).
 /// Creates the bus (and its NDI sender + flush thread) on first use for
 /// a given `bus_id`. Also tears down any exclusive `Tap` on the same
 /// `bus_id` — mutually exclusive per bus, same as `start_audio_tap`'s
 /// side of that relationship.
 ///
-/// Returns `Err` only when a *new* bus is needed and the NDI runtime
-/// couldn't be loaded — same conditions as `start_audio_tap`.
+/// Returns `Err` only when a *new* bus is needed and `NdiSender::new`
+/// itself failed — same conditions as `start_audio_tap`.
 pub fn set_mix_sources(bus_id: &str, source_names: &[String]) -> Result<(), String> {
     stop_audio_tap(bus_id);
     let Ok(mut guard) = MIX_BUSES.lock() else {
@@ -212,19 +223,19 @@ pub fn set_mix_sources(bus_id: &str, source_names: &[String]) -> Result<(), Stri
         Some(existing) => Arc::clone(existing),
         None => {
             let ndi_name = format!("FrameSW-Monitor-{bus_id}");
-            let Some(sender) = NdiSender::new(&ndi_name) else {
-                return Err(format!(
-                    "NDI runtime unavailable — could not create sender '{ndi_name}'"
-                ));
-            };
+            let sender = NdiSender::new(&ndi_name).map_err(|e| format!("'{ndi_name}': {e}"))?;
             let bus = Arc::new(MixBus {
                 sender,
-                latest: Mutex::new(HashMap::new()),
+                queues: Mutex::new(HashMap::new()),
                 sources: Mutex::new(HashSet::new()),
                 meta: Mutex::new((0, 0)),
                 running: Arc::new(AtomicBool::new(true)),
+                thread_handle: Mutex::new(None),
             });
-            spawn_mix_flush_thread(Arc::clone(&bus));
+            let handle = spawn_mix_flush_thread(Arc::clone(&bus));
+            if let Ok(mut slot) = bus.thread_handle.lock() {
+                *slot = Some(handle);
+            }
             buses.insert(bus_id.to_string(), Arc::clone(&bus));
             bus
         }
@@ -233,22 +244,39 @@ pub fn set_mix_sources(bus_id: &str, source_names: &[String]) -> Result<(), Stri
     if let Ok(mut sources) = bus.sources.lock() {
         *sources = new_set.clone();
     }
-    if let Ok(mut latest) = bus.latest.lock() {
-        latest.retain(|name, _| new_set.contains(name));
+    if let Ok(mut queues) = bus.queues.lock() {
+        queues.retain(|name, _| new_set.contains(name));
     }
     Ok(())
 }
 
-/// Tears down `bus_id`'s mix bus (stops its flush thread, destroys its
-/// NDI sender). Stopping an already-inactive bus is a safe no-op.
+/// Tears down `bus_id`'s mix bus: stops its flush thread and **blocks
+/// until that thread has actually exited** (at most one
+/// `MIX_FLUSH_INTERVAL`, ~10ms) before returning, so its `NdiSender` is
+/// genuinely destroyed — not just scheduled to be — by the time this
+/// call returns. That's what makes it safe for `start_audio_tap` to
+/// immediately create a new sender under the same name right after
+/// (see `MixBus::thread_handle`'s doc comment for the real failure this
+/// fixes). Stopping an already-inactive bus is a safe no-op.
 pub fn stop_mix_bus(bus_id: &str) {
-    if let Ok(mut guard) = MIX_BUSES.lock() {
-        if let Some(buses) = guard.as_mut() {
-            if let Some(bus) = buses.remove(bus_id) {
-                bus.running.store(false, Ordering::Release);
-            }
-        }
+    let bus = {
+        let Ok(mut guard) = MIX_BUSES.lock() else {
+            return;
+        };
+        guard.as_mut().and_then(|buses| buses.remove(bus_id))
+    };
+    let Some(bus) = bus else {
+        return;
+    };
+    bus.running.store(false, Ordering::Release);
+    let handle = bus.thread_handle.lock().ok().and_then(|mut h| h.take());
+    if let Some(handle) = handle {
+        let _ = handle.join();
     }
+    // `bus` (our last `Arc` reference, now that the flush thread's own
+    // clone has also dropped by returning) goes out of scope here,
+    // running `NdiSender`'s `Drop` synchronously before this function
+    // returns.
 }
 
 /// The set of sources currently contributing to `bus_id`'s mix, if that
@@ -260,58 +288,73 @@ pub fn mix_bus_sources(bus_id: &str) -> Option<HashSet<String>> {
     bus.sources.lock().ok().map(|s| s.clone())
 }
 
-fn spawn_mix_flush_thread(bus: Arc<MixBus>) {
+fn spawn_mix_flush_thread(bus: Arc<MixBus>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         while bus.running.load(Ordering::Acquire) {
             std::thread::sleep(MIX_FLUSH_INTERVAL);
             if !bus.running.load(Ordering::Acquire) {
                 return;
             }
-            // Drained, not just read — a source that's stopped
-            // delivering callbacks (unstaged, gone silent-and-inactive,
-            // removed from the mix) must drop out of the *next* flush
-            // rather than keep contributing its last-known buffer
-            // forever.
-            let contributions: Vec<Vec<f32>> = {
-                let Ok(mut latest) = bus.latest.lock() else {
-                    continue;
-                };
-                latest.drain().map(|(_, buf)| buf).collect()
-            };
-            let Some(mixed) = sum_contributions(&contributions) else {
-                continue;
-            };
             let (sample_rate, channels) = bus.meta.lock().map(|m| *m).unwrap_or((0, 0));
             if sample_rate <= 0 || channels <= 0 {
                 continue;
             }
-            let frames = mixed.len() as i32 / channels;
-            let mut mixed = mixed;
-            bus.sender.send_audio(sample_rate, channels, frames, &mut mixed);
+            let frames_per_flush =
+                ((sample_rate as f64) * MIX_FLUSH_INTERVAL.as_secs_f64()).round() as usize;
+            if frames_per_flush == 0 {
+                continue;
+            }
+            let channels = channels as usize;
+            let mixed = {
+                let Ok(mut queues) = bus.queues.lock() else {
+                    continue;
+                };
+                drain_and_sum(&mut queues, channels, frames_per_flush)
+            };
+            let Some(mut mixed) = mixed else {
+                continue;
+            };
+            bus.sender.send_audio(sample_rate, channels as i32, frames_per_flush as i32, &mut mixed);
         }
-    });
+    })
 }
 
-/// Sums multiple contributors' most-recent buffers (each already
-/// rearranged into contiguous per-channel runs) into one combined
-/// buffer, truncating to the shortest contributor's length — a source
-/// delivering a differently-sized chunk at this exact flush moment loses
-/// only its tail past that point. Acceptable for a monitoring feature,
-/// not broadcast-grade sample-accurate alignment. `None` if there's
-/// nothing to mix (no contributors this cycle, or the shortest is
-/// empty).
-fn sum_contributions(contributions: &[Vec<f32>]) -> Option<Vec<f32>> {
-    let frames = contributions.iter().map(Vec::len).min()?;
-    if frames == 0 {
-        return None;
-    }
-    let mut mixed = vec![0.0f32; frames];
-    for buf in contributions {
-        for (m, &s) in mixed.iter_mut().zip(buf.iter()) {
-            *m += s;
+/// Pops exactly `frames_per_flush` samples per channel from each
+/// contributing source's FIFO queues (silence-padding a source that
+/// hasn't delivered enough yet this cycle — real underrun, e.g. it just
+/// joined the mix, not a bug; the alternative, blocking for more data,
+/// would stall every *other* contributor's audio too) and sums them into
+/// one combined planar buffer. A source whose queue count doesn't match
+/// `channels` is skipped entirely (defensive guard — channel count is
+/// one global OBS setting shared by every source, so this isn't an
+/// expected path, just cheap insurance against ever indexing out of
+/// bounds). `None` if nothing in the map has the right channel count to
+/// contribute at all this cycle.
+///
+/// Split out from the flush thread's own loop so this — the actual
+/// mixing arithmetic, and the fix for "one layer plays clean, another
+/// stutters" — is unit-testable without a real thread, NDI sender, or
+/// bus registry.
+fn drain_and_sum(
+    queues: &mut HashMap<String, Vec<VecDeque<f32>>>,
+    channels: usize,
+    frames_per_flush: usize,
+) -> Option<Vec<f32>> {
+    let mut mixed = vec![0.0f32; frames_per_flush * channels];
+    let mut any_contributor = false;
+    for per_channel in queues.values_mut() {
+        if per_channel.len() != channels {
+            continue;
+        }
+        any_contributor = true;
+        for (ch, queue) in per_channel.iter_mut().enumerate() {
+            for i in 0..frames_per_flush {
+                let sample = queue.pop_front().unwrap_or(0.0);
+                mixed[ch * frames_per_flush + i] += sample;
+            }
         }
     }
-    Some(mixed)
+    any_contributor.then_some(mixed)
 }
 
 /// Called from `lib.rs`'s existing `audio_capture_callback` — every
@@ -380,8 +423,28 @@ pub fn forward_if_tapped(
                 }
                 let buffer =
                     build_scaled_planar_buffer(channels as usize, frames as usize, planes, volume);
-                if let Ok(mut latest) = bus.latest.lock() {
-                    latest.insert(source_name.to_string(), buffer);
+                if let Ok(mut queues) = bus.queues.lock() {
+                    let frames_usize = frames as usize;
+                    let channels_usize = channels as usize;
+                    let per_channel = queues
+                        .entry(source_name.to_string())
+                        .or_insert_with(|| (0..channels_usize).map(|_| VecDeque::new()).collect());
+                    if per_channel.len() != channels_usize {
+                        per_channel.resize_with(channels_usize, VecDeque::new);
+                    }
+                    // Capped so a source the flush thread has stopped
+                    // draining (bus paused, or this source just left the
+                    // mix a moment before this particular callback still
+                    // in flight) can't grow its queue unboundedly — same
+                    // "cap buffered audio" reasoning `ndi.rs`'s own
+                    // receive loop already uses on the app side.
+                    const MAX_QUEUED_FRAMES: usize = 48_000; // ~1s at 48kHz — generous.
+                    for (ch, queue) in per_channel.iter_mut().enumerate() {
+                        queue.extend(&buffer[ch * frames_usize..(ch + 1) * frames_usize]);
+                        while queue.len() > MAX_QUEUED_FRAMES {
+                            queue.pop_front();
+                        }
+                    }
                 }
                 if let Ok(mut meta) = bus.meta.lock() {
                     *meta = (sample_rate, channels);
@@ -519,30 +582,62 @@ mod tests {
         assert_eq!(buffer, vec![1.0, 1.0, 0.0, 0.0]);
     }
 
+    fn queues_from(source_channel_samples: &[(&str, &[&[f32]])]) -> HashMap<String, Vec<VecDeque<f32>>> {
+        source_channel_samples
+            .iter()
+            .map(|(name, channels)| {
+                let per_channel = channels.iter().map(|samples| samples.iter().copied().collect()).collect();
+                (name.to_string(), per_channel)
+            })
+            .collect()
+    }
+
     #[test]
-    fn sum_contributions_adds_sample_by_sample() {
-        let a = vec![1.0f32, 0.5, -0.5];
-        let b = vec![0.2f32, 0.2, 0.2];
-        let mixed = sum_contributions(&[a, b]).expect("two real contributors");
+    fn drain_and_sum_adds_two_sources_sample_by_sample() {
+        let mut queues = queues_from(&[
+            ("a", &[&[1.0f32, 0.5, -0.5]]),
+            ("b", &[&[0.2f32, 0.2, 0.2]]),
+        ]);
+        let mixed = drain_and_sum(&mut queues, 1, 3).expect("two real contributors");
         assert_eq!(mixed, vec![1.2, 0.7, -0.3]);
     }
 
     #[test]
-    fn sum_contributions_truncates_to_the_shortest_contributor() {
-        let a = vec![1.0f32, 1.0, 1.0, 1.0];
-        let b = vec![0.5f32, 0.5];
-        let mixed = sum_contributions(&[a, b]).expect("still real contributors");
-        assert_eq!(mixed, vec![1.5, 1.5]);
+    fn drain_and_sum_pads_a_source_that_underran_with_silence_not_a_repeat() {
+        // The actual bug being fixed: a source delivering less than one
+        // flush cycle's worth of samples must contribute silence for the
+        // remainder, never its last values repeated — that repetition is
+        // exactly what a "keep only the latest chunk" design produced
+        // (live-reported stutter on one of two mixed layers).
+        let mut queues = queues_from(&[
+            ("a", &[&[1.0f32, 1.0, 1.0, 1.0]]),
+            ("b", &[&[0.5f32, 0.5]]), // only 2 of this cycle's 4 frames available
+        ]);
+        let mixed = drain_and_sum(&mut queues, 1, 4).expect("still a real contributor");
+        assert_eq!(mixed, vec![1.5, 1.5, 1.0, 1.0]);
     }
 
     #[test]
-    fn sum_contributions_is_none_when_nothing_contributed() {
-        assert_eq!(sum_contributions(&[]), None);
+    fn drain_and_sum_handles_multiple_channels_independently() {
+        let mut queues = queues_from(&[("a", &[&[1.0f32, 1.0], &[-1.0f32, -1.0]])]);
+        let mixed = drain_and_sum(&mut queues, 2, 2).expect("one contributor, two channels");
+        // Planar layout: channel 0's frames, then channel 1's.
+        assert_eq!(mixed, vec![1.0, 1.0, -1.0, -1.0]);
     }
 
     #[test]
-    fn sum_contributions_is_none_for_all_empty_contributors() {
-        assert_eq!(sum_contributions(&[vec![], vec![]]), None);
+    fn drain_and_sum_skips_a_source_with_the_wrong_channel_count() {
+        // Defensive guard path — channel count is one global OBS setting,
+        // so this isn't expected in practice, but must never panic/index
+        // out of bounds if it somehow happened.
+        let mut queues = queues_from(&[("mono-in-a-stereo-mix", &[&[1.0f32, 1.0]])]);
+        assert_eq!(drain_and_sum(&mut queues, 2, 2), None);
+    }
+
+    #[test]
+    fn drain_and_sum_is_none_when_nothing_contributed() {
+        let mut queues = HashMap::new();
+        assert_eq!(drain_and_sum(&mut queues, 2, 480), None);
     }
 
     #[test]

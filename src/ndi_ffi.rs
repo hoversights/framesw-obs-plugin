@@ -177,13 +177,19 @@ unsafe impl Sync for NdiSender {}
 
 impl NdiSender {
     /// `name` becomes the NDI source name other machines/apps see (e.g.
-    /// `"FrameSW-Monitor-1"`). `None` if the NDI runtime couldn't be
-    /// loaded/initialized, or `NDIlib_send_create` itself returned null
-    /// (e.g. genuinely out of resources) — both degrade to "no monitor
-    /// audio for this bus," never a panic.
-    pub fn new(name: &str) -> Option<Self> {
-        let lib = ndi()?;
-        let cname = CString::new(name).ok()?;
+    /// `"FrameSW-Monitor-1"`). `Err` degrades to "no monitor audio for
+    /// this bus," never a panic — but distinguishes *why*, unlike an
+    /// earlier version that collapsed every failure into one generic
+    /// "NDI runtime unavailable" message: that made a real, specific
+    /// `NDIlib_send_create` failure (e.g. a same-named sender not yet
+    /// fully torn down — live-reported, 2026-07-24: switching from the
+    /// combined-mix bus to an exclusive Solo tap on the same `bus_id`
+    /// repeatedly failed this way) indistinguishable from the runtime
+    /// genuinely never having loaded at all.
+    pub fn new(name: &str) -> Result<Self, String> {
+        let lib = ndi().ok_or_else(|| "NDI runtime not loaded/initialized".to_string())?;
+        let cname = CString::new(name)
+            .map_err(|_| format!("sender name '{name}' contains an embedded NUL"))?;
         let create = NdiSendCreate {
             p_ndi_name: cname.as_ptr(),
             p_groups: std::ptr::null(),
@@ -201,9 +207,12 @@ impl NdiSender {
         // this point, but not before).
         drop(cname);
         if instance.is_null() {
-            return None;
+            return Err(format!(
+                "NDIlib_send_create('{name}') returned null (runtime loaded fine — this is a \
+                 real creation failure, e.g. a same-named sender not fully torn down yet)"
+            ));
         }
-        Some(NdiSender { instance })
+        Ok(NdiSender { instance })
     }
 
     /// Pushes one planar `f32` audio frame. `channels` must match
