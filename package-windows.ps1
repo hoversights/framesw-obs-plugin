@@ -29,6 +29,13 @@ New-Item -ItemType Directory -Path "$PluginDir\bin\64bit" -Force | Out-Null
 Copy-Item "target\release\framesw_obs_plugin.dll" `
     "$PluginDir\bin\64bit\framesw-companion.dll"
 
+# Plain-text version marker FrameSW's app reads to detect a stale
+# installed copy (platform::installed_plugin_version) - single source of
+# truth is Cargo.toml, same convention as package-macos.sh's Info.plist.
+$VersionLine = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+$Version = $VersionLine.Matches.Groups[1].Value
+Set-Content -Path "$PluginDir\VERSION" -Value $Version -NoNewline
+
 Write-Host ""
 Write-Host "Built: $PluginDir"
 Write-Host ""

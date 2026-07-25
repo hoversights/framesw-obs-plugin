@@ -30,7 +30,15 @@ fi
 
 BUNDLE="target/framesw-companion.plugin"
 rm -rf "$BUNDLE"
-mkdir -p "$BUNDLE/Contents/MacOS"
+mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
+
+# Single source of truth for the version stamped into both the Info.plist
+# below and the plain-text VERSION file FrameSW's app reads to detect a
+# stale installed copy (platform::installed_plugin_version) — previously
+# Info.plist's CFBundleShortVersionString was hand-typed and had already
+# drifted from this value.
+VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+echo -n "$VERSION" > "$BUNDLE/Contents/Resources/VERSION"
 
 if [ "$RELEASE_MODE" = "1" ]; then
     echo "Building universal release binary..."
@@ -53,7 +61,7 @@ else
 fi
 chmod +x "$BUNDLE/Contents/MacOS/framesw-companion"
 
-cat > "$BUNDLE/Contents/Info.plist" << 'EOF'
+cat > "$BUNDLE/Contents/Info.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -71,7 +79,7 @@ cat > "$BUNDLE/Contents/Info.plist" << 'EOF'
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0-phase1-spike</string>
+	<string>$VERSION</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>MacOSX</string>
