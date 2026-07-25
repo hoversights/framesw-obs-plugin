@@ -599,6 +599,115 @@ fn handle_tap_status_impl(
     obs_data::set_string(response_data, "source_name", &status.unwrap_or_default());
 }
 
+extern "C" fn handle_set_mix_sources(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_set_mix_sources",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_set_mix_sources_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{"bus_id": "preview", "source_names": "shot-abc,shot-def"}`
+/// — comma-joined rather than a real `obs_data_array_t` of objects
+/// (which is what OBS's own array type actually holds; there's no plain
+/// "array of strings" primitive in this API without wrapping each name
+/// in its own object). A single delimited string keeps this at zero new
+/// dependencies and no JSON parsing — safe because FrameSW's own
+/// `input_name`s are internally generated (`shot-<uuid>`) and a bare
+/// OBS scene/source name never contains a comma in practice. Response:
+/// `{"ok": true}` or `{"ok": false, "error": "..."}`.
+fn handle_set_mix_sources_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let bus_id = obs_data::get_string(request_data, "bus_id").unwrap_or_default();
+    let source_names_raw = obs_data::get_string(request_data, "source_names").unwrap_or_default();
+    let source_names: Vec<String> = source_names_raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    match audio_tap::set_mix_sources(&bus_id, &source_names) {
+        Ok(()) => obs_data::set_bool(response_data, "ok", true),
+        Err(e) => {
+            log_line(&format!("set_mix_sources bus_id='{bus_id}' failed: {e}"));
+            obs_data::set_bool(response_data, "ok", false);
+            obs_data::set_string(response_data, "error", &e);
+        }
+    }
+}
+
+extern "C" fn handle_stop_mix_bus(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_stop_mix_bus",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_stop_mix_bus_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{"bus_id": "preview"}`. Response: always `{"ok": true}` —
+/// same "stopping an inactive bus is a defined no-op" shape as
+/// `stop_audio_tap`.
+fn handle_stop_mix_bus_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let bus_id = obs_data::get_string(request_data, "bus_id").unwrap_or_default();
+    audio_tap::stop_mix_bus(&bus_id);
+    obs_data::set_bool(response_data, "ok", true);
+}
+
+extern "C" fn handle_mix_status(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_mix_status",
+        (),
+        std::panic::AssertUnwindSafe(|| handle_mix_status_impl(request_data, response_data, priv_data)),
+    );
+}
+
+/// Request: `{"bus_id": "preview"}`. Response: `{"ok": true, "active":
+/// bool, "source_names": "shot-a,shot-b"}` — same comma-joined shape
+/// `set_mix_sources` accepts, empty string when `active` is `false` or
+/// nothing is currently contributing.
+fn handle_mix_status_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let bus_id = obs_data::get_string(request_data, "bus_id").unwrap_or_default();
+    let sources = audio_tap::mix_bus_sources(&bus_id);
+    obs_data::set_bool(response_data, "ok", true);
+    obs_data::set_bool(response_data, "active", sources.is_some());
+    let joined = sources.map(|s| s.into_iter().collect::<Vec<_>>().join(",")).unwrap_or_default();
+    obs_data::set_string(response_data, "source_names", &joined);
+}
+
 // ---------------------------------------------------------------------
 // obs-websocket vendor wiring — registers as vendor "framesw" and
 // forwards whatever `audio_capture_callback` has accumulated, at a
@@ -729,6 +838,9 @@ pub extern "C" fn obs_module_post_load() {
             ("start_audio_tap", handle_start_audio_tap as calldata::RequestCallbackFn),
             ("stop_audio_tap", handle_stop_audio_tap as calldata::RequestCallbackFn),
             ("tap_status", handle_tap_status as calldata::RequestCallbackFn),
+            ("set_mix_sources", handle_set_mix_sources as calldata::RequestCallbackFn),
+            ("stop_mix_bus", handle_stop_mix_bus as calldata::RequestCallbackFn),
+            ("mix_status", handle_mix_status as calldata::RequestCallbackFn),
         ] {
             if calldata::register_request(vendor, request_type, callback) {
                 log_line(&format!("registered vendor request \"{request_type}\""));

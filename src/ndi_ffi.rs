@@ -163,10 +163,17 @@ pub struct NdiSender {
 
 // SAFETY: `NDIlib_send_send_audio_v2` is documented thread-safe for a
 // single sender instance called from one thread at a time, which is
-// exactly how `audio_tap.rs` uses it (each bus's sender is only ever
-// driven from whichever OBS audio-capture callback currently owns that
-// bus's tap).
+// exactly how `audio_tap.rs` uses it — an exclusive `Tap`'s sender is
+// only ever driven from whichever OBS audio-capture callback thread
+// currently owns that bus, and a `MixBus`'s sender is only ever driven
+// by its own single dedicated flush thread (other callback threads only
+// ever touch that bus's `latest`/`meta` mutexes, never `sender`
+// directly). `Sync` is needed so `Arc<MixBus>` can be shared with that
+// flush thread at all — it does not imply concurrent calls actually
+// happen, only that the type is safe to reference from more than one
+// thread, which holds given the access pattern above.
 unsafe impl Send for NdiSender {}
+unsafe impl Sync for NdiSender {}
 
 impl NdiSender {
     /// `name` becomes the NDI source name other machines/apps see (e.g.

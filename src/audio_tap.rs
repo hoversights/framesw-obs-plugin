@@ -1,4 +1,4 @@
-//! Preview-layer audio monitor taps: forwards a chosen OBS source's real,
+//! Preview-layer audio monitor taps: forwards chosen OBS sources' real,
 //! passively-captured audio (the *same* `audio_capture_callback` already
 //! attached to every source for metering — see `lib.rs`) out as an
 //! audio-only NDI sender per "bus," FrameSW's own monitor-speaker
@@ -11,9 +11,26 @@
 //! never touch the program mix" invariant, which this mechanism was
 //! built specifically to honor for Preview-only content OBS's own
 //! monitoring device structurally cannot reach).
+//!
+//! Two independent mechanisms share this module, both keyed by `bus_id`:
+//! - **`Tap`** (`start_audio_tap`/`stop_audio_tap`/`tap_status`): one
+//!   exclusive source, forwarded directly on every matching callback —
+//!   backs Solo. Unchanged since it first shipped and proven live.
+//! - **`MixBus`** (`set_mix_sources`/`stop_mix_bus`): a *set* of sources,
+//!   each callback overwriting only its own latest-chunk slot, summed
+//!   and flushed by a dedicated timer thread — backs "no layer soloed,
+//!   monitor the whole Preview mix." Needed because a scene's own
+//!   composited audio does **not** reliably fire through this callback
+//!   while it's merely Studio Mode's Preview (confirmed live,
+//!   2026-07-24) — unlike individual sources, which do (Phase 1's
+//!   founding discovery) — so the combined mix has to be built here,
+//!   from the same individual per-source taps that already work,
+//!   instead of tapping the scene directly.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::ndi_ffi::NdiSender;
 
@@ -22,9 +39,10 @@ struct Tap {
     sender: NdiSender,
 }
 
-/// bus_id -> its active tap, if any. A bus with no entry is simply
-/// inactive — every lookup/removal here is a safe, idempotent no-op via
-/// `HashMap`'s own semantics for a missing key, never an error.
+/// bus_id -> its active exclusive tap, if any. A bus with no entry is
+/// simply inactive — every lookup/removal here is a safe, idempotent
+/// no-op via `HashMap`'s own semantics for a missing key, never an
+/// error.
 static TAPS: Mutex<Option<HashMap<String, Tap>>> = Mutex::new(None);
 
 /// What `start_audio_tap` should do for a given bus, based purely on
@@ -55,11 +73,14 @@ fn decide_start(existing_source_name: Option<&str>, requested_source_name: &str)
     }
 }
 
-/// Starts (or repoints) a monitor tap: `bus_id` (e.g. `"1"`, used to name
-/// the NDI source `"FrameSW-Monitor-{bus_id}"`) begins forwarding
-/// `source_name`'s real audio. Safe to call repeatedly with the same
-/// arguments (a no-op) or with a different `source_name` for an
-/// already-active `bus_id` (repoints in place — see `decide_start`).
+/// Starts (or repoints) an exclusive monitor tap: `bus_id` (e.g.
+/// `"preview"`, used to name the NDI source `"FrameSW-Monitor-{bus_id}"`)
+/// begins forwarding `source_name`'s real audio, alone. Safe to call
+/// repeatedly with the same arguments (a no-op) or with a different
+/// `source_name` for an already-active `bus_id` (repoints in place —
+/// see `decide_start`). Also tears down any `MixBus` on the same
+/// `bus_id` — the two mechanisms are mutually exclusive per bus (Solo
+/// engaged means the mix is not currently what's being monitored).
 ///
 /// Returns `Err` only when a *new* sender is needed and the NDI runtime
 /// itself couldn't be loaded/initialized (e.g. not installed on this
@@ -70,6 +91,7 @@ fn decide_start(existing_source_name: Option<&str>, requested_source_name: &str)
 /// no-op-when-nothing-matches behavior, which is what makes a
 /// no-audio-source layer safe rather than a crash).
 pub fn start_audio_tap(source_name: &str, bus_id: &str) -> Result<(), String> {
+    stop_mix_bus(bus_id);
     let Ok(mut guard) = TAPS.lock() else {
         return Err("tap registry lock poisoned".to_string());
     };
@@ -96,9 +118,9 @@ pub fn start_audio_tap(source_name: &str, bus_id: &str) -> Result<(), String> {
     }
 }
 
-/// Stops `bus_id`'s tap and tears down its NDI sender (via `Tap`'s
-/// `Drop`). Removing an already-inactive (or never-started) bus is a
-/// safe no-op.
+/// Stops `bus_id`'s exclusive tap and tears down its NDI sender (via
+/// `Tap`'s `Drop`). Removing an already-inactive (or never-started) bus
+/// is a safe no-op.
 pub fn stop_audio_tap(bus_id: &str) {
     if let Ok(mut guard) = TAPS.lock() {
         if let Some(taps) = guard.as_mut() {
@@ -107,19 +129,189 @@ pub fn stop_audio_tap(bus_id: &str) {
     }
 }
 
-/// The source currently tapped for `bus_id`, if that bus is active.
+/// The source currently tapped for `bus_id`, if that bus has an active
+/// exclusive tap (not a mix bus — see `mix_bus_sources` for that).
 pub fn tap_status(bus_id: &str) -> Option<String> {
     let guard = TAPS.lock().ok()?;
     guard.as_ref()?.get(bus_id).map(|t| t.source_name.clone())
 }
 
-/// Tears down every active tap — called from `obs_module_unload` so no
-/// NDI sender outlives the plugin itself (each `Tap`'s `Drop` calls
-/// `NDIlib_send_destroy`).
+/// Tears down every active exclusive tap and mix bus — called from
+/// `obs_module_unload` so no NDI sender outlives the plugin itself.
 pub fn stop_all() {
     if let Ok(mut guard) = TAPS.lock() {
         *guard = None;
     }
+    if let Ok(mut guard) = MIX_BUSES.lock() {
+        if let Some(buses) = guard.take() {
+            for bus in buses.into_values() {
+                bus.running.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Mix bus: combines several sources' real audio into one NDI sender —
+// backs "no layer soloed, monitor the whole Preview mix."
+// ---------------------------------------------------------------------
+
+/// How often the mix flush thread sums and sends a combined frame.
+/// Matches the ballpark of a typical OBS audio callback cadence (roughly
+/// one ~480-sample chunk per ~10ms at 48kHz) closely enough that a
+/// contributing source's *latest* buffer is rarely more than one flush
+/// cycle stale — good enough for local monitoring, not a broadcast-grade
+/// synchronized mixer.
+const MIX_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
+
+struct MixBus {
+    sender: NdiSender,
+    /// source_name -> that source's most recent post-volume planar
+    /// buffer (already scaled and rearranged into contiguous per-channel
+    /// runs — same shape `build_scaled_planar_buffer` produces),
+    /// overwritten — never accumulated — on every matching callback.
+    /// Independent sources fire at independent, uncoordinated times, so
+    /// summing has to happen on its own fixed cadence (the flush
+    /// thread), not per-callback.
+    latest: Mutex<HashMap<String, Vec<f32>>>,
+    /// Which sources currently belong to this bus's mix — read by
+    /// `forward_if_tapped` to decide whether to update `latest`,
+    /// written by `set_mix_sources`.
+    sources: Mutex<HashSet<String>>,
+    /// Most recently observed `(sample_rate, channels)` — shared by
+    /// every contributor in practice, since all of OBS's audio callbacks
+    /// come from the one global audio pipeline (`obs_get_audio_info`),
+    /// but tracked per-bus rather than assumed so the flush thread always
+    /// sends with whatever's actually current.
+    meta: Mutex<(i32, i32)>,
+    running: Arc<AtomicBool>,
+}
+
+/// bus_id -> its active mix bus, if any.
+static MIX_BUSES: Mutex<Option<HashMap<String, Arc<MixBus>>>> = Mutex::new(None);
+
+/// Replaces which sources contribute to `bus_id`'s combined mix. Safe to
+/// call repeatedly, including with the same set (a no-op beyond updating
+/// bookkeeping) or a changed set (sources no longer listed stop
+/// contributing from this call on — their last-known buffer is dropped
+/// immediately, not left to keep being summed as stale phantom audio).
+/// Creates the bus (and its NDI sender + flush thread) on first use for
+/// a given `bus_id`. Also tears down any exclusive `Tap` on the same
+/// `bus_id` — mutually exclusive per bus, same as `start_audio_tap`'s
+/// side of that relationship.
+///
+/// Returns `Err` only when a *new* bus is needed and the NDI runtime
+/// couldn't be loaded — same conditions as `start_audio_tap`.
+pub fn set_mix_sources(bus_id: &str, source_names: &[String]) -> Result<(), String> {
+    stop_audio_tap(bus_id);
+    let Ok(mut guard) = MIX_BUSES.lock() else {
+        return Err("mix bus registry lock poisoned".to_string());
+    };
+    let buses = guard.get_or_insert_with(HashMap::new);
+    let bus = match buses.get(bus_id) {
+        Some(existing) => Arc::clone(existing),
+        None => {
+            let ndi_name = format!("FrameSW-Monitor-{bus_id}");
+            let Some(sender) = NdiSender::new(&ndi_name) else {
+                return Err(format!(
+                    "NDI runtime unavailable — could not create sender '{ndi_name}'"
+                ));
+            };
+            let bus = Arc::new(MixBus {
+                sender,
+                latest: Mutex::new(HashMap::new()),
+                sources: Mutex::new(HashSet::new()),
+                meta: Mutex::new((0, 0)),
+                running: Arc::new(AtomicBool::new(true)),
+            });
+            spawn_mix_flush_thread(Arc::clone(&bus));
+            buses.insert(bus_id.to_string(), Arc::clone(&bus));
+            bus
+        }
+    };
+    let new_set: HashSet<String> = source_names.iter().cloned().collect();
+    if let Ok(mut sources) = bus.sources.lock() {
+        *sources = new_set.clone();
+    }
+    if let Ok(mut latest) = bus.latest.lock() {
+        latest.retain(|name, _| new_set.contains(name));
+    }
+    Ok(())
+}
+
+/// Tears down `bus_id`'s mix bus (stops its flush thread, destroys its
+/// NDI sender). Stopping an already-inactive bus is a safe no-op.
+pub fn stop_mix_bus(bus_id: &str) {
+    if let Ok(mut guard) = MIX_BUSES.lock() {
+        if let Some(buses) = guard.as_mut() {
+            if let Some(bus) = buses.remove(bus_id) {
+                bus.running.store(false, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// The set of sources currently contributing to `bus_id`'s mix, if that
+/// bus is active (empty set if active but nothing's contributing yet —
+/// distinct from `None`, "no mix bus exists for this bus_id at all").
+pub fn mix_bus_sources(bus_id: &str) -> Option<HashSet<String>> {
+    let guard = MIX_BUSES.lock().ok()?;
+    let bus = guard.as_ref()?.get(bus_id)?;
+    bus.sources.lock().ok().map(|s| s.clone())
+}
+
+fn spawn_mix_flush_thread(bus: Arc<MixBus>) {
+    std::thread::spawn(move || {
+        while bus.running.load(Ordering::Acquire) {
+            std::thread::sleep(MIX_FLUSH_INTERVAL);
+            if !bus.running.load(Ordering::Acquire) {
+                return;
+            }
+            // Drained, not just read — a source that's stopped
+            // delivering callbacks (unstaged, gone silent-and-inactive,
+            // removed from the mix) must drop out of the *next* flush
+            // rather than keep contributing its last-known buffer
+            // forever.
+            let contributions: Vec<Vec<f32>> = {
+                let Ok(mut latest) = bus.latest.lock() else {
+                    continue;
+                };
+                latest.drain().map(|(_, buf)| buf).collect()
+            };
+            let Some(mixed) = sum_contributions(&contributions) else {
+                continue;
+            };
+            let (sample_rate, channels) = bus.meta.lock().map(|m| *m).unwrap_or((0, 0));
+            if sample_rate <= 0 || channels <= 0 {
+                continue;
+            }
+            let frames = mixed.len() as i32 / channels;
+            let mut mixed = mixed;
+            bus.sender.send_audio(sample_rate, channels, frames, &mut mixed);
+        }
+    });
+}
+
+/// Sums multiple contributors' most-recent buffers (each already
+/// rearranged into contiguous per-channel runs) into one combined
+/// buffer, truncating to the shortest contributor's length — a source
+/// delivering a differently-sized chunk at this exact flush moment loses
+/// only its tail past that point. Acceptable for a monitoring feature,
+/// not broadcast-grade sample-accurate alignment. `None` if there's
+/// nothing to mix (no contributors this cycle, or the shortest is
+/// empty).
+fn sum_contributions(contributions: &[Vec<f32>]) -> Option<Vec<f32>> {
+    let frames = contributions.iter().map(Vec::len).min()?;
+    if frames == 0 {
+        return None;
+    }
+    let mut mixed = vec![0.0f32; frames];
+    for buf in contributions {
+        for (m, &s) in mixed.iter_mut().zip(buf.iter()) {
+            *m += s;
+        }
+    }
+    Some(mixed)
 }
 
 /// Called from `lib.rs`'s existing `audio_capture_callback` — every
@@ -159,25 +351,43 @@ pub fn forward_if_tapped(
     if frames <= 0 || channels <= 0 {
         return;
     }
-    let Ok(guard) = TAPS.lock() else {
-        return;
-    };
-    let Some(taps) = guard.as_ref() else {
-        return;
-    };
-    if taps.is_empty() {
-        return;
-    }
-    // A source can, in principle, be tapped by more than one bus at once
-    // (e.g. monitored on two different outputs simultaneously) — forward
-    // to every match, not just the first.
-    for tap in taps.values() {
-        if tap.source_name != source_name {
-            continue;
+    if let Ok(guard) = TAPS.lock() {
+        if let Some(taps) = guard.as_ref() {
+            // A source can, in principle, be tapped by more than one bus
+            // at once (e.g. monitored on two different outputs
+            // simultaneously) — forward to every match, not just the
+            // first.
+            for tap in taps.values() {
+                if tap.source_name != source_name {
+                    continue;
+                }
+                let mut buffer = build_scaled_planar_buffer(
+                    channels as usize,
+                    frames as usize,
+                    planes,
+                    volume,
+                );
+                tap.sender.send_audio(sample_rate, channels, frames, &mut buffer);
+            }
         }
-        let mut buffer =
-            build_scaled_planar_buffer(channels as usize, frames as usize, planes, volume);
-        tap.sender.send_audio(sample_rate, channels, frames, &mut buffer);
+    }
+    if let Ok(guard) = MIX_BUSES.lock() {
+        if let Some(buses) = guard.as_ref() {
+            for bus in buses.values() {
+                let belongs = bus.sources.lock().map(|s| s.contains(source_name)).unwrap_or(false);
+                if !belongs {
+                    continue;
+                }
+                let buffer =
+                    build_scaled_planar_buffer(channels as usize, frames as usize, planes, volume);
+                if let Ok(mut latest) = bus.latest.lock() {
+                    latest.insert(source_name.to_string(), buffer);
+                }
+                if let Ok(mut meta) = bus.meta.lock() {
+                    *meta = (sample_rate, channels);
+                }
+            }
+        }
     }
 }
 
@@ -232,7 +442,8 @@ mod tests {
 
     // Real lifecycle exercise of the registry itself — a fresh, test-only
     // bus_id per test avoids any cross-test interference from the shared
-    // global `TAPS` map under parallel `cargo test` execution.
+    // global `TAPS`/`MIX_BUSES` maps under parallel `cargo test`
+    // execution.
 
     #[test]
     fn stop_on_a_never_started_bus_is_a_safe_no_op() {
@@ -306,5 +517,61 @@ mod tests {
         let planes: [*const f32; 2] = [left.as_ptr(), std::ptr::null()];
         let buffer = build_scaled_planar_buffer(2, 2, &planes, 1.0);
         assert_eq!(buffer, vec![1.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn sum_contributions_adds_sample_by_sample() {
+        let a = vec![1.0f32, 0.5, -0.5];
+        let b = vec![0.2f32, 0.2, 0.2];
+        let mixed = sum_contributions(&[a, b]).expect("two real contributors");
+        assert_eq!(mixed, vec![1.2, 0.7, -0.3]);
+    }
+
+    #[test]
+    fn sum_contributions_truncates_to_the_shortest_contributor() {
+        let a = vec![1.0f32, 1.0, 1.0, 1.0];
+        let b = vec![0.5f32, 0.5];
+        let mixed = sum_contributions(&[a, b]).expect("still real contributors");
+        assert_eq!(mixed, vec![1.5, 1.5]);
+    }
+
+    #[test]
+    fn sum_contributions_is_none_when_nothing_contributed() {
+        assert_eq!(sum_contributions(&[]), None);
+    }
+
+    #[test]
+    fn sum_contributions_is_none_for_all_empty_contributors() {
+        assert_eq!(sum_contributions(&[vec![], vec![]]), None);
+    }
+
+    #[test]
+    fn set_mix_sources_never_leaves_a_half_registered_entry() {
+        // Same NDI-runtime-dependent split as `start_never_leaves_a_
+        // half_registered_entry` above.
+        let names = vec!["shot-a".to_string(), "shot-b".to_string()];
+        let result = set_mix_sources("test-mix-bus-lifecycle", &names);
+        match result {
+            Ok(()) => {
+                let sources = mix_bus_sources("test-mix-bus-lifecycle").unwrap();
+                assert_eq!(sources, names.into_iter().collect());
+                stop_mix_bus("test-mix-bus-lifecycle");
+                assert_eq!(mix_bus_sources("test-mix-bus-lifecycle"), None);
+            }
+            Err(_) => {
+                assert_eq!(mix_bus_sources("test-mix-bus-lifecycle"), None);
+            }
+        }
+    }
+
+    #[test]
+    fn mix_bus_sources_is_none_for_a_bus_that_was_never_started() {
+        assert_eq!(mix_bus_sources("test-mix-bus-untouched"), None);
+    }
+
+    #[test]
+    fn stop_mix_bus_on_a_never_started_bus_is_a_safe_no_op() {
+        stop_mix_bus("test-mix-bus-never-started");
+        assert_eq!(mix_bus_sources("test-mix-bus-never-started"), None);
     }
 }
