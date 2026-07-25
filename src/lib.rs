@@ -307,6 +307,7 @@ fn audio_capture_callback_impl(
                     channels as i32,
                     audio_data.frames as i32,
                     &planes,
+                    volume,
                 );
             }
         }

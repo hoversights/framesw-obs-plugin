@@ -137,12 +137,24 @@ pub fn stop_all() {
 /// (all planes null, or `frames == 0`) simply matches zero taps' worth
 /// of real work below and returns — this is exactly what keeps a
 /// no-audio-source layer from ever being able to crash the bus.
+///
+/// `volume`: the source's *current* `obs_source_get_volume` (same value
+/// `lib.rs`'s metering path already reads and applies to its peak-dB
+/// calculation) — applied here to the actual samples for the same
+/// reason: `obs_source_add_audio_capture_callback` hands over audio
+/// *before* the fader is applied (libobs applies volume later, at mix
+/// time), so without this the monitor would play the raw input level
+/// regardless of where the operator's own fader is sitting. Live-
+/// reported: an earlier version forwarded the raw samples unscaled,
+/// which correctly muted/soloed the right *source* but ignored its
+/// fader position entirely.
 pub fn forward_if_tapped(
     source_name: &str,
     sample_rate: i32,
     channels: i32,
     frames: i32,
     planes: &[*const f32],
+    volume: f32,
 ) {
     if frames <= 0 || channels <= 0 {
         return;
@@ -163,27 +175,40 @@ pub fn forward_if_tapped(
         if tap.source_name != source_name {
             continue;
         }
-        // NDI's `NDIlib_audio_frame_v2_t` wants one contiguous buffer
-        // with a fixed inter-channel byte stride; OBS instead gives each
-        // channel its own independent allocation, so this rebuilds it
-        // into the shape NDI actually needs. Real per-callback cost, but
-        // bounded (a few hundred samples times a handful of channels)
-        // and only ever paid for a source that's actually tapped.
-        let frames_usize = frames as usize;
-        let mut buffer = vec![0.0f32; frames_usize * channels as usize];
-        for (ch, &plane) in planes.iter().take(channels as usize).enumerate() {
-            if plane.is_null() {
-                continue;
-            }
-            // Safety: caller (`lib.rs`'s audio_capture_callback_impl)
-            // guarantees each non-null plane points at `frames` valid
-            // `f32` samples for the duration of this call — the same
-            // guarantee libobs's own callback contract already gives it.
-            let src = unsafe { std::slice::from_raw_parts(plane, frames_usize) };
-            buffer[ch * frames_usize..(ch + 1) * frames_usize].copy_from_slice(src);
-        }
+        let mut buffer =
+            build_scaled_planar_buffer(channels as usize, frames as usize, planes, volume);
         tap.sender.send_audio(sample_rate, channels, frames, &mut buffer);
     }
+}
+
+/// Rebuilds OBS's independent per-channel plane buffers into the single
+/// contiguous, evenly-strided `f32` buffer NDI's send API expects
+/// (`channel_stride_in_bytes` in `ndi_ffi.rs`), scaling every sample by
+/// `volume` along the way — split out from `forward_if_tapped` so this
+/// arithmetic (the actual fix for the "plays raw input, not post-fader"
+/// bug) is unit-testable without a real NDI sender or tap registry.
+fn build_scaled_planar_buffer(
+    channels: usize,
+    frames: usize,
+    planes: &[*const f32],
+    volume: f32,
+) -> Vec<f32> {
+    let mut buffer = vec![0.0f32; frames * channels];
+    for (ch, &plane) in planes.iter().take(channels).enumerate() {
+        if plane.is_null() {
+            continue;
+        }
+        // Safety: caller (`lib.rs`'s audio_capture_callback_impl)
+        // guarantees each non-null plane points at `frames` valid `f32`
+        // samples for the duration of this call — the same guarantee
+        // libobs's own callback contract already gives it.
+        let src = unsafe { std::slice::from_raw_parts(plane, frames) };
+        let dst = &mut buffer[ch * frames..(ch + 1) * frames];
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d = s * volume;
+        }
+    }
+    buffer
 }
 
 #[cfg(test)]
@@ -246,7 +271,7 @@ mod tests {
     #[test]
     fn forward_with_no_active_taps_does_not_panic() {
         let planes: [*const f32; 2] = [std::ptr::null(), std::ptr::null()];
-        forward_if_tapped("shot-that-does-not-exist", 48000, 2, 480, &planes);
+        forward_if_tapped("shot-that-does-not-exist", 48000, 2, 480, &planes, 1.0);
     }
 
     #[test]
@@ -260,6 +285,26 @@ mod tests {
         let left = vec![0.25f32; 480];
         let right = vec![-0.25f32; 480];
         let planes: [*const f32; 2] = [left.as_ptr(), right.as_ptr()];
-        forward_if_tapped("shot-currently-live", 48000, 2, 480, &planes);
+        forward_if_tapped("shot-currently-live", 48000, 2, 480, &planes, 0.5);
+    }
+
+    #[test]
+    fn build_scaled_planar_buffer_applies_volume_to_every_sample() {
+        // The actual bug being fixed: the monitor was playing the raw,
+        // pre-fader input regardless of where the layer's own volume
+        // slider sat — this is the exact arithmetic that must scale it.
+        let left = [1.0f32, 0.5, -1.0];
+        let right = [0.2f32, -0.4, 0.6];
+        let planes: [*const f32; 2] = [left.as_ptr(), right.as_ptr()];
+        let buffer = build_scaled_planar_buffer(2, 3, &planes, 0.25);
+        assert_eq!(buffer, vec![0.25, 0.125, -0.25, 0.05, -0.1, 0.15]);
+    }
+
+    #[test]
+    fn build_scaled_planar_buffer_skips_null_planes_without_panicking() {
+        let left = [1.0f32, 1.0];
+        let planes: [*const f32; 2] = [left.as_ptr(), std::ptr::null()];
+        let buffer = build_scaled_planar_buffer(2, 2, &planes, 1.0);
+        assert_eq!(buffer, vec![1.0, 1.0, 0.0, 0.0]);
     }
 }
