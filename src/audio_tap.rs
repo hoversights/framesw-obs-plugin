@@ -341,12 +341,12 @@ fn drain_and_sum(
     frames_per_flush: usize,
 ) -> Option<Vec<f32>> {
     let mut mixed = vec![0.0f32; frames_per_flush * channels];
-    let mut any_contributor = false;
+    let mut contributor_count = 0usize;
     for per_channel in queues.values_mut() {
         if per_channel.len() != channels {
             continue;
         }
-        any_contributor = true;
+        contributor_count += 1;
         for (ch, queue) in per_channel.iter_mut().enumerate() {
             for i in 0..frames_per_flush {
                 let sample = queue.pop_front().unwrap_or(0.0);
@@ -354,7 +354,26 @@ fn drain_and_sum(
             }
         }
     }
-    any_contributor.then_some(mixed)
+    if contributor_count == 0 {
+        return None;
+    }
+    // Headroom: divide by how many sources actually contributed *this
+    // cycle*, not a fixed constant — two normal, near-unity sources
+    // summed raw easily doubles peak amplitude, which is exactly what
+    // live-reported "distorted" audio sounded like (harsh clipping, not
+    // stuttering — a different bug from the underrun/repeat one above).
+    // A single contributor plays at its own unattenuated level (nothing
+    // to clash with); each of N contributors effectively drops to 1/N so
+    // the sum can't exceed unity as long as no individual source already
+    // does. The final `clamp` is defense in depth for the case where one
+    // does (upstream gain/filters pushing a source past 0dBFS on its
+    // own) — never let a monitor-only mix send a value NDI/the receiving
+    // device would have to clip unpredictably.
+    let gain = 1.0 / contributor_count as f32;
+    for sample in &mut mixed {
+        *sample = (*sample * gain).clamp(-1.0, 1.0);
+    }
+    Some(mixed)
 }
 
 /// Called from `lib.rs`'s existing `audio_capture_callback` — every
@@ -593,13 +612,38 @@ mod tests {
     }
 
     #[test]
-    fn drain_and_sum_adds_two_sources_sample_by_sample() {
+    fn drain_and_sum_adds_two_sources_then_applies_headroom() {
         let mut queues = queues_from(&[
             ("a", &[&[1.0f32, 0.5, -0.5]]),
             ("b", &[&[0.2f32, 0.2, 0.2]]),
         ]);
         let mixed = drain_and_sum(&mut queues, 1, 3).expect("two real contributors");
-        assert_eq!(mixed, vec![1.2, 0.7, -0.3]);
+        // Raw sum would be [1.2, 0.7, -0.3] — halved (two contributors)
+        // to leave headroom, the actual fix for live-reported distortion
+        // (two normal-level sources summed raw clipping hard).
+        assert_eq!(mixed, vec![0.6, 0.35, -0.15]);
+    }
+
+    #[test]
+    fn drain_and_sum_single_contributor_plays_at_full_level() {
+        // No headroom penalty when there's nothing else to clash with —
+        // only N > 1 contributors should ever get attenuated.
+        let mut queues = queues_from(&[("a", &[&[0.8f32, -0.8]])]);
+        let mixed = drain_and_sum(&mut queues, 1, 2).expect("one contributor");
+        assert_eq!(mixed, vec![0.8, -0.8]);
+    }
+
+    #[test]
+    fn drain_and_sum_clamps_a_source_that_already_exceeds_unity_on_its_own() {
+        // Defense in depth: headroom alone only guarantees no clipping
+        // when every individual contributor is itself within [-1, 1] —
+        // upstream gain/filters could push one source past that on its
+        // own, and the final mix must never hand NDI/the output device
+        // something further out of range than a single hot source
+        // already was.
+        let mut queues = queues_from(&[("a", &[&[1.5f32, -1.5]])]);
+        let mixed = drain_and_sum(&mut queues, 1, 2).expect("one (hot) contributor");
+        assert_eq!(mixed, vec![1.0, -1.0]);
     }
 
     #[test]
@@ -614,14 +658,16 @@ mod tests {
             ("b", &[&[0.5f32, 0.5]]), // only 2 of this cycle's 4 frames available
         ]);
         let mixed = drain_and_sum(&mut queues, 1, 4).expect("still a real contributor");
-        assert_eq!(mixed, vec![1.5, 1.5, 1.0, 1.0]);
+        // Raw sum [1.5, 1.5, 1.0, 1.0], halved for headroom (2 contributors).
+        assert_eq!(mixed, vec![0.75, 0.75, 0.5, 0.5]);
     }
 
     #[test]
     fn drain_and_sum_handles_multiple_channels_independently() {
         let mut queues = queues_from(&[("a", &[&[1.0f32, 1.0], &[-1.0f32, -1.0]])]);
         let mixed = drain_and_sum(&mut queues, 2, 2).expect("one contributor, two channels");
-        // Planar layout: channel 0's frames, then channel 1's.
+        // Planar layout: channel 0's frames, then channel 1's. One
+        // contributor, so no headroom attenuation.
         assert_eq!(mixed, vec![1.0, 1.0, -1.0, -1.0]);
     }
 

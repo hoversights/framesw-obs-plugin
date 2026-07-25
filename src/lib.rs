@@ -301,13 +301,21 @@ fn audio_capture_callback_impl(
                     .iter()
                     .map(|p| p.cast::<f32>().cast_const())
                     .collect();
+                // Same `muted` the peak-dB calc above already honors
+                // (this callback's own `muted` parameter, direct from
+                // libobs) — without this, a muted layer's raw audio
+                // still reached the monitor tap/mix, since `muted` only
+                // ever affected the *meter* reading here, never what got
+                // forwarded. Live-reported: the Layer Audio Out strip's
+                // own mute button had no effect on the monitor speaker.
+                let effective_volume = if muted { 0.0 } else { volume };
                 audio_tap::forward_if_tapped(
                     &name,
                     info.samples_per_sec as i32,
                     channels as i32,
                     audio_data.frames as i32,
                     &planes,
-                    volume,
+                    effective_volume,
                 );
             }
         }
