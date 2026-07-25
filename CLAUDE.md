@@ -40,7 +40,18 @@ README.md has the full user-facing story; keep the two in sync.
    Changing names, types, semantics, or cadence breaks apps built
    against it. Additive-only changes go behind new fields; anything
    else requires an explicit protocol version (e.g. a new event name or
-   a version field) negotiated before release.
+   a version field) negotiated before release. The
+   `start_audio_tap`/`stop_audio_tap`/`tap_status` vendor *requests*
+   (`audio_tap.rs`) are separate, additive surface — adding to them
+   doesn't touch this contract, but their own request/response shapes
+   (see each handler's doc comment in `lib.rs`) are likewise frozen once
+   shipped.
+3. **A monitor tap only ever reads.** `audio_tap.rs` copies the exact
+   same samples the metering path already reads into a separate NDI
+   send buffer — it must never call anything that could re-route or
+   mute a source's real OBS output. If a future change needs the tap to
+   *do* more than forward audio out, that's a new, separately-reviewed
+   mechanism, not an extension of this one.
 
 FFI hygiene when touching `src/`: every FFI declaration here was ported
 from verbatim-fetched obs-studio/obs-websocket headers, with provenance

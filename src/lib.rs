@@ -34,8 +34,10 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Mutex;
 
+mod audio_tap;
 mod calldata;
 mod group;
+mod ndi_ffi;
 mod obs_data;
 mod platform;
 
@@ -97,6 +99,38 @@ crate::resolved_fn!(obs_source_active: extern "C" fn(*const ObsSourceT) -> bool)
 // should track the slider must do the same, hence this lookup.
 crate::resolved_fn!(obs_source_get_volume: extern "C" fn(*const ObsSourceT) -> f32);
 crate::resolved_fn!(obs_source_get_name: extern "C" fn(*const ObsSourceT) -> *const c_char);
+// `libobs/obs.h`'s `struct obs_audio_info { uint32_t samples_per_sec; enum
+// speaker_layout speakers; };` and `EXPORT bool obs_get_audio_info(struct
+// obs_audio_info *oai);` — the one global source of "how many channels/
+// what sample rate is this OBS instance actually running," needed to
+// rebuild a tapped source's per-plane audio into the single contiguous,
+// evenly-strided buffer NDI's send API expects (`ndi_ffi.rs`). Verified
+// against `obsproject/obs-studio@master`'s real header, not guessed.
+#[repr(C)]
+struct ObsAudioInfo {
+    samples_per_sec: u32,
+    speakers: u32,
+}
+crate::resolved_fn!(obs_get_audio_info: extern "C" fn(*mut ObsAudioInfo) -> bool);
+
+/// `libobs/media-io/audio-io.h`'s `get_audio_channels` — a `static
+/// inline` C function, so it has no linkable symbol to resolve; this is
+/// the same lookup table ported by hand, values verified against the
+/// real header's `enum speaker_layout`
+/// (`SPEAKERS_UNKNOWN=0, MONO=1, STEREO=2, 2POINT1=3, 4POINT0=4,
+/// 4POINT1=5, 5POINT1=6, 7POINT1=8`).
+fn speaker_layout_to_channels(speakers: u32) -> u32 {
+    match speakers {
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 4,
+        5 => 5,
+        6 => 6,
+        8 => 8,
+        _ => 0, // SPEAKERS_UNKNOWN (0) or anything unrecognized.
+    }
+}
 // `libobs/obs.h`: "Gets a source by its name. Increments the source
 // reference counter, use obs_source_release to release it when complete."
 // Needed because `obs_enum_sources` (confirmed against the real
@@ -246,6 +280,37 @@ fn audio_capture_callback_impl(
         CStr::from_ptr(ptr).to_string_lossy().into_owned()
     };
     let active = obs_source_active(source);
+
+    // Preview-layer monitor taps (`audio_tap.rs`) — reuses this exact
+    // callback (already attached to every source, unconditionally) rather
+    // than a second `obs_source_add_audio_capture_callback` registration,
+    // so a tap adds no new attachment for libobs's callback list to
+    // dedupe (see the `resolved_fn!` comment on
+    // `obs_source_remove_audio_capture_callback` above for why that
+    // matters). Channel count/sample rate come from OBS's one global
+    // audio setting (`obs_get_audio_info`), since `audio_data` itself
+    // carries neither — missing symbol or a not-yet-tapped source both
+    // degrade to `forward_if_tapped` doing nothing, same as every other
+    // best-effort path in this crate.
+    if let Some(obs_get_audio_info) = obs_get_audio_info() {
+        let mut info = ObsAudioInfo { samples_per_sec: 0, speakers: 0 };
+        if obs_get_audio_info(&mut info) {
+            let channels = speaker_layout_to_channels(info.speakers);
+            if channels > 0 {
+                let planes: Vec<*const f32> = audio_data.data[..channels as usize]
+                    .iter()
+                    .map(|p| p.cast::<f32>().cast_const())
+                    .collect();
+                audio_tap::forward_if_tapped(
+                    &name,
+                    info.samples_per_sec as i32,
+                    channels as i32,
+                    audio_data.frames as i32,
+                    &planes,
+                );
+            }
+        }
+    }
 
     if let Ok(mut guard) = LEVELS.lock() {
         guard.get_or_insert_with(HashMap::new).insert(name, (peak_db, active));
@@ -429,6 +494,111 @@ fn handle_manage_group_impl(
 }
 
 // ---------------------------------------------------------------------
+// PROMPT 17: monitor-speaker audio taps (`audio_tap.rs`/`ndi_ffi.rs`) —
+// three vendor requests mirroring `manage_group`'s own shape/pattern
+// (FrameSW's request, this plugin's response, `{"ok": bool, "error":
+// string}` on failure). All three are idempotent per `audio_tap.rs`'s
+// own doc comments — safe for FrameSW to call repeatedly, e.g. on every
+// OBS reconnect's reconciliation pass, without needing to track "did I
+// already ask for this" on the app side.
+// ---------------------------------------------------------------------
+
+extern "C" fn handle_start_audio_tap(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_start_audio_tap",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_start_audio_tap_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{"source_name": "shot-abc123", "bus_id": "1"}`. Response:
+/// `{"ok": true}` or `{"ok": false, "error": "..."}`.
+fn handle_start_audio_tap_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let source_name = obs_data::get_string(request_data, "source_name").unwrap_or_default();
+    let bus_id = obs_data::get_string(request_data, "bus_id").unwrap_or_default();
+
+    match audio_tap::start_audio_tap(&source_name, &bus_id) {
+        Ok(()) => obs_data::set_bool(response_data, "ok", true),
+        Err(e) => {
+            log_line(&format!("start_audio_tap bus_id='{bus_id}' failed: {e}"));
+            obs_data::set_bool(response_data, "ok", false);
+            obs_data::set_string(response_data, "error", &e);
+        }
+    }
+}
+
+extern "C" fn handle_stop_audio_tap(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_stop_audio_tap",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_stop_audio_tap_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{"bus_id": "1"}`. Response: always `{"ok": true}` — stopping
+/// an already-inactive bus is a defined no-op, per `audio_tap::
+/// stop_audio_tap`'s own doc comment, not an error condition.
+fn handle_stop_audio_tap_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let bus_id = obs_data::get_string(request_data, "bus_id").unwrap_or_default();
+    audio_tap::stop_audio_tap(&bus_id);
+    obs_data::set_bool(response_data, "ok", true);
+}
+
+extern "C" fn handle_tap_status(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_tap_status",
+        (),
+        std::panic::AssertUnwindSafe(|| handle_tap_status_impl(request_data, response_data, priv_data)),
+    );
+}
+
+/// Request: `{"bus_id": "1"}`. Response: `{"ok": true, "active": bool,
+/// "source_name": string}` — `source_name` is `""` when `active` is
+/// `false`, mirroring `obs_data_get_string`'s own "missing means empty
+/// string" convention used throughout this plugin.
+fn handle_tap_status_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let bus_id = obs_data::get_string(request_data, "bus_id").unwrap_or_default();
+    let status = audio_tap::tap_status(&bus_id);
+    obs_data::set_bool(response_data, "ok", true);
+    obs_data::set_bool(response_data, "active", status.is_some());
+    obs_data::set_string(response_data, "source_name", &status.unwrap_or_default());
+}
+
+// ---------------------------------------------------------------------
 // obs-websocket vendor wiring — registers as vendor "framesw" and
 // forwards whatever `audio_capture_callback` has accumulated, at a
 // steady ~10Hz, as a batched `audio_levels` event.
@@ -554,6 +724,17 @@ pub extern "C" fn obs_module_post_load() {
         } else {
             log_line("failed to register vendor request \"manage_group\"");
         }
+        for (request_type, callback) in [
+            ("start_audio_tap", handle_start_audio_tap as calldata::RequestCallbackFn),
+            ("stop_audio_tap", handle_stop_audio_tap as calldata::RequestCallbackFn),
+            ("tap_status", handle_tap_status as calldata::RequestCallbackFn),
+        ] {
+            if calldata::register_request(vendor, request_type, callback) {
+                log_line(&format!("registered vendor request \"{request_type}\""));
+            } else {
+                log_line(&format!("failed to register vendor request \"{request_type}\""));
+            }
+        }
     })
 }
 
@@ -577,6 +758,8 @@ pub extern "C" fn obs_module_unload() {
         for handle in handles {
             let _ = handle.join();
         }
+        // No active monitor tap's NDI sender should outlive the plugin.
+        audio_tap::stop_all();
         log_line("unloaded — background threads stopped cleanly");
     })
 }

@@ -30,6 +30,24 @@ as vendor `framesw`). If obs-websocket isn't installed, the plugin still
 loads and logs locally — nothing here requires FrameSW or obs-websocket
 to be present to load cleanly.
 
+### Monitor-speaker audio taps
+
+The same audio capture callback also backs three vendor *requests* —
+`start_audio_tap`/`stop_audio_tap`/`tap_status` — that let FrameSW ask
+for a chosen source's real audio to be forwarded out as an audio-only NDI
+sender (named `FrameSW-Monitor-{bus_id}`), so an operator can listen to
+content that's only staged in Preview (or any layer, live or not)
+through their own headphones/monitor speaker. This exists specifically
+because OBS's own audio monitoring device only ever reflects the
+Program/output mix — it has no concept of monitoring Preview-only
+content — and it's a **read-only tap**: the plugin only ever copies the
+same samples it already reads for metering into a separate NDI send
+buffer, never touching OBS's own routing, so it's structurally incapable
+of affecting what's actually streamed or recorded. Requires the [NDI
+Runtime](https://ndi.video/tools/) to be installed (FrameSW bundles it);
+without it, taps simply produce no audio — the rest of the plugin is
+unaffected.
+
 ## Requirements
 
 - **OBS Studio 30.2 or newer**.
