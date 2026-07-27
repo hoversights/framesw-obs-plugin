@@ -30,11 +30,27 @@ Copy-Item "target\release\framesw_obs_plugin.dll" `
     "$PluginDir\bin\64bit\framesw-companion.dll"
 
 # Plain-text version marker FrameSW's app reads to detect a stale
-# installed copy (platform::installed_plugin_version) - single source of
-# truth is Cargo.toml, same convention as package-macos.sh's Info.plist.
+# installed copy (platform::installed_plugin_version). Cargo.toml's
+# version alone relies on someone remembering to bump it every time the
+# plugin's behavior changes - in practice that didn't happen for 6 real
+# feature/fix commits in a row (all shipped as "0.1.0"), so this check
+# never once fired. Appending this repo's own commit hash (plus a
+# -dirty marker for uncommitted local changes, same convention as
+# package-macos.sh) makes every real code change produce a different
+# stamp automatically, with no bump discipline required at all.
 $VersionLine = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
 $Version = $VersionLine.Matches.Groups[1].Value
-Set-Content -Path "$PluginDir\VERSION" -Value $Version -NoNewline
+$GitSha = (git rev-parse --short HEAD 2>$null)
+if (-not $GitSha) { $GitSha = "unknown" }
+$GitDirty = ""
+git diff --quiet 2>$null
+if ($LASTEXITCODE -ne 0) { $GitDirty = "-dirty" }
+else {
+    git diff --cached --quiet 2>$null
+    if ($LASTEXITCODE -ne 0) { $GitDirty = "-dirty" }
+}
+$Stamp = "$Version+$GitSha$GitDirty"
+Set-Content -Path "$PluginDir\VERSION" -Value $Stamp -NoNewline
 
 Write-Host ""
 Write-Host "Built: $PluginDir"

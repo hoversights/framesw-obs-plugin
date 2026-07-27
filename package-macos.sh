@@ -32,13 +32,28 @@ BUNDLE="target/framesw-companion.plugin"
 rm -rf "$BUNDLE"
 mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"
 
-# Single source of truth for the version stamped into both the Info.plist
-# below and the plain-text VERSION file FrameSW's app reads to detect a
-# stale installed copy (platform::installed_plugin_version) — previously
-# Info.plist's CFBundleShortVersionString was hand-typed and had already
-# drifted from this value.
+# Single source of truth for Info.plist's CFBundleShortVersionString —
+# previously that field was hand-typed and had already drifted from this
+# value.
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
-echo -n "$VERSION" > "$BUNDLE/Contents/Resources/VERSION"
+
+# The plain-text VERSION file FrameSW's app actually compares
+# (platform::installed_plugin_version / plugin_update_available) is a
+# *separate*, richer stamp: Cargo.toml's version alone relies on someone
+# remembering to bump it every time the plugin's behavior changes, and
+# in practice that didn't happen for 6 real feature/fix commits in a
+# row (all shipped as "0.1.0") — so FrameSW never once detected a stale
+# installed copy. Appending this repo's own commit hash (plus a -dirty
+# marker for uncommitted local changes) makes every real code change
+# produce a different stamp automatically, with no bump discipline
+# required at all.
+GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+GIT_DIRTY=""
+if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+    GIT_DIRTY="-dirty"
+fi
+STAMP="${VERSION}+${GIT_SHA}${GIT_DIRTY}"
+echo -n "$STAMP" > "$BUNDLE/Contents/Resources/VERSION"
 
 if [ "$RELEASE_MODE" = "1" ]; then
     echo "Building universal release binary..."
