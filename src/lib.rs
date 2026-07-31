@@ -52,6 +52,10 @@ use obs_data::SourceLevel;
 pub enum ObsModuleT {}
 /// Opaque — same story for `obs_source_t` (`libobs/obs.h`).
 pub enum ObsSourceT {}
+/// Opaque — same story for `obs_scene_t` (`libobs/obs-scene.h`). A distinct
+/// handle type from `ObsSourceT` in libobs's own public API, even though a
+/// scene is a source under the hood.
+pub enum ObsSceneT {}
 
 /// `libobs/media-io/media-io-defs.h`: `#define MAX_AV_PLANES 8`.
 const MAX_AV_PLANES: usize = 8;
@@ -140,6 +144,18 @@ fn speaker_layout_to_channels(speakers: u32) -> u32 {
 // ("PGM-A"/"PGM-B") is a direct name lookup, not the general rescan.
 crate::resolved_fn!(obs_get_source_by_name: extern "C" fn(*const c_char) -> *mut ObsSourceT);
 crate::resolved_fn!(obs_source_release: extern "C" fn(*mut ObsSourceT));
+// Live-confirmed real fix (2026-07-31): a scene created via obs-websocket's
+// `CreateScene` request crashes OBS 32.1.2 (its own release notes call
+// obs-websocket's Canvas support "partial"/"unstable"; `CreateScene` has no
+// way to specify a canvas at all, and every reproduced crash followed a
+// real `CreateScene` call). A scene created this way instead — the exact
+// same libobs entry point OBS's own "+" button in the Scenes panel calls —
+// never crashed in direct manual A/B testing. `create_scene` (below) lets
+// FrameSW ask this plugin to create its fixed-name scenes natively, from
+// inside OBS's own process, instead of ever calling `CreateScene` over
+// obs-websocket.
+crate::resolved_fn!(obs_scene_create: extern "C" fn(*const c_char) -> *mut ObsSceneT);
+crate::resolved_fn!(obs_scene_release: extern "C" fn(*mut ObsSceneT));
 // libobs/util/base.h — real signature is variadic
 // (`void blog(int log_level, const char *format, ...)`). Always called
 // here with a fixed "%s" format and exactly one string arg (`log_line`
@@ -202,6 +218,21 @@ fn ffi_guard<R>(entry_point: &str, fallback: R, f: impl FnOnce() -> R + std::pan
 /// `obs_enum_sources`'s internal mutex lock, called from
 /// `spawn_periodic_rescan`, at the moment the user closed OBS.
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// Live-confirmed real crash source (2026-07-31): `spawn_periodic_rescan`'s
+/// `attach_scene_audio_taps` calls native `obs_get_source_by_name`/
+/// `obs_source_add_audio_capture_callback` directly on PGM-A/PGM-B, on its
+/// own independent 5s timer — completely decoupled from FrameSW's app-side
+/// websocket timing. Racing that against FrameSW's own `CreateScene`/
+/// `SetCurrentProgramScene` calls for the same scene (right after a
+/// reconnect that has to recreate one) crashed OBS reliably. FrameSW's app
+/// now sends `pause_rescan` before doing that scene setup and
+/// `resume_rescan` right after — this flag is what the rescan loop checks
+/// each cycle to skip its work (but keep looping, ready to resume) while
+/// paused. Defaults to *not* paused so the plugin behaves exactly as
+/// before if the app never sends either request (e.g. an older FrameSW
+/// version, or another obs-websocket client entirely).
+static RESCAN_PAUSED: AtomicBool = AtomicBool::new(false);
 
 /// Join handles for both background threads, so `obs_module_unload` can
 /// block until they've actually exited rather than merely requesting a
@@ -421,13 +452,23 @@ fn spawn_periodic_rescan() {
         if SHUTTING_DOWN.load(Ordering::Acquire) {
             return;
         }
-        if let Some(obs_enum_sources) = obs_enum_sources() {
-            if !SHUTTING_DOWN.load(Ordering::Acquire) {
-                obs_enum_sources(attach_callback_enum_proc, std::ptr::null_mut());
+        // See `RESCAN_PAUSED`'s doc comment — skip this cycle's work
+        // entirely while paused, but keep the loop (and its shutdown
+        // responsiveness) alive. Checked only here, once per ~5s cycle —
+        // a `resume_rescan` sent while this thread is mid-sleep takes
+        // effect at the next cycle, not instantly. That's fine for this
+        // flag's actual use (FrameSW pauses before, and resumes some time
+        // after, its own scene setup) — instant pickup isn't needed the
+        // way it is for shutdown.
+        if !RESCAN_PAUSED.load(Ordering::Acquire) {
+            if let Some(obs_enum_sources) = obs_enum_sources() {
+                if !SHUTTING_DOWN.load(Ordering::Acquire) {
+                    obs_enum_sources(attach_callback_enum_proc, std::ptr::null_mut());
+                }
             }
-        }
-        if !SHUTTING_DOWN.load(Ordering::Acquire) {
-            attach_scene_audio_taps();
+            if !SHUTTING_DOWN.load(Ordering::Acquire) {
+                attach_scene_audio_taps();
+            }
         }
         // Slept in short increments rather than one 5s call so a shutdown
         // request is noticed within ~100ms instead of up to 5s later.
@@ -574,6 +615,126 @@ fn handle_stop_audio_tap_impl(
     let response_data = obs_data::from_void(response_data);
     let bus_id = obs_data::get_string(request_data, "bus_id").unwrap_or_default();
     audio_tap::stop_audio_tap(&bus_id);
+    obs_data::set_bool(response_data, "ok", true);
+}
+
+extern "C" fn handle_create_scene(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_create_scene",
+        (),
+        std::panic::AssertUnwindSafe(|| handle_create_scene_impl(request_data, response_data, priv_data)),
+    );
+}
+
+/// Request: `{"name": "PGM-A"}`. Response: `{"ok": true}` (whether the
+/// scene was just created or already existed — idempotent, matching this
+/// plugin's other creation-adjacent handlers) or `{"ok": false, "error":
+/// "..."}` if the required libobs symbols aren't resolvable (shouldn't
+/// happen in practice; this plugin only loads inside a real OBS process).
+/// See `obs_scene_create`'s own comment for why this exists at all.
+fn handle_create_scene_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let name = obs_data::get_string(request_data, "name").unwrap_or_default();
+
+    let (Some(obs_get_source_by_name), Some(obs_source_release)) =
+        (obs_get_source_by_name(), obs_source_release())
+    else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "required libobs symbols unavailable");
+        return;
+    };
+    let Ok(cname) = CString::new(name.as_str()) else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "invalid scene name");
+        return;
+    };
+
+    // Idempotent: if it's already there (a previous connect already made
+    // it, or a prior call to this same request), do nothing further.
+    let existing = obs_get_source_by_name(cname.as_ptr());
+    if !existing.is_null() {
+        obs_source_release(existing);
+        obs_data::set_bool(response_data, "ok", true);
+        return;
+    }
+
+    let (Some(obs_scene_create), Some(obs_scene_release)) = (obs_scene_create(), obs_scene_release())
+    else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "required libobs symbols unavailable");
+        return;
+    };
+    let scene = obs_scene_create(cname.as_ptr());
+    if scene.is_null() {
+        log_line(&format!("create_scene '{name}' failed: obs_scene_create returned null"));
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_scene_create returned null");
+        return;
+    }
+    // Releases only this handler's own strong reference — the scene
+    // itself stays registered in the current scene collection, same
+    // "released immediately after attaching" reasoning already used for
+    // audio taps elsewhere in this file.
+    obs_scene_release(scene);
+    log_line(&format!("created scene '{name}' natively (obs_scene_create)"));
+    obs_data::set_bool(response_data, "ok", true);
+}
+
+extern "C" fn handle_pause_rescan(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_pause_rescan",
+        (),
+        std::panic::AssertUnwindSafe(|| handle_pause_rescan_impl(request_data, response_data, priv_data)),
+    );
+}
+
+/// Request: `{}`. Response: always `{"ok": true}`. See `RESCAN_PAUSED`'s
+/// doc comment for why this exists — FrameSW sends this before recreating
+/// any of its own scenes, and `resume_rescan` after.
+fn handle_pause_rescan_impl(
+    _request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let response_data = obs_data::from_void(response_data);
+    RESCAN_PAUSED.store(true, Ordering::Release);
+    obs_data::set_bool(response_data, "ok", true);
+}
+
+extern "C" fn handle_resume_rescan(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_resume_rescan",
+        (),
+        std::panic::AssertUnwindSafe(|| handle_resume_rescan_impl(request_data, response_data, priv_data)),
+    );
+}
+
+/// Request: `{}`. Response: always `{"ok": true}`. Counterpart to
+/// `handle_pause_rescan_impl` — see `RESCAN_PAUSED`'s doc comment.
+fn handle_resume_rescan_impl(
+    _request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let response_data = obs_data::from_void(response_data);
+    RESCAN_PAUSED.store(false, Ordering::Release);
     obs_data::set_bool(response_data, "ok", true);
 }
 
@@ -845,6 +1006,9 @@ pub extern "C" fn obs_module_post_load() {
         for (request_type, callback) in [
             ("start_audio_tap", handle_start_audio_tap as calldata::RequestCallbackFn),
             ("stop_audio_tap", handle_stop_audio_tap as calldata::RequestCallbackFn),
+            ("create_scene", handle_create_scene as calldata::RequestCallbackFn),
+            ("pause_rescan", handle_pause_rescan as calldata::RequestCallbackFn),
+            ("resume_rescan", handle_resume_rescan as calldata::RequestCallbackFn),
             ("tap_status", handle_tap_status as calldata::RequestCallbackFn),
             ("set_mix_sources", handle_set_mix_sources as calldata::RequestCallbackFn),
             ("stop_mix_bus", handle_stop_mix_bus as calldata::RequestCallbackFn),
