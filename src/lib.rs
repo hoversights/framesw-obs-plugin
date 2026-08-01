@@ -56,6 +56,8 @@ pub enum ObsSourceT {}
 /// handle type from `ObsSourceT` in libobs's own public API, even though a
 /// scene is a source under the hood.
 pub enum ObsSceneT {}
+/// Opaque — same story for `obs_output_t` (`libobs/obs.h`).
+pub enum ObsOutputT {}
 
 /// `libobs/media-io/media-io-defs.h`: `#define MAX_AV_PLANES 8`.
 const MAX_AV_PLANES: usize = 8;
@@ -144,18 +146,60 @@ fn speaker_layout_to_channels(speakers: u32) -> u32 {
 // ("PGM-A"/"PGM-B") is a direct name lookup, not the general rescan.
 crate::resolved_fn!(obs_get_source_by_name: extern "C" fn(*const c_char) -> *mut ObsSourceT);
 crate::resolved_fn!(obs_source_release: extern "C" fn(*mut ObsSourceT));
-// Live-confirmed real fix (2026-07-31): a scene created via obs-websocket's
-// `CreateScene` request crashes OBS 32.1.2 (its own release notes call
-// obs-websocket's Canvas support "partial"/"unstable"; `CreateScene` has no
-// way to specify a canvas at all, and every reproduced crash followed a
-// real `CreateScene` call). A scene created this way instead — the exact
-// same libobs entry point OBS's own "+" button in the Scenes panel calls —
-// never crashed in direct manual A/B testing. `create_scene` (below) lets
-// FrameSW ask this plugin to create its fixed-name scenes natively, from
-// inside OBS's own process, instead of ever calling `CreateScene` over
-// obs-websocket.
+// CORRECTION (2026-07-31, second pass): an earlier comment here claimed
+// obs-websocket's `CreateScene` request was itself crashing OBS 32.1.2,
+// and blamed OBS 32.1's "partial"/"unstable" Canvas support. Both claims
+// were wrong. Symbolicating the crash reports against the shipped
+// `obs-websocket` binary put the fault in its `GetCurrentProgramScene`
+// handler instead — see `get_current_scenes` below for the real bug.
+// `obs_scene_create` is also not canvas-blind: libobs implements it as
+// `create_id(obs->data.main_canvas, "scene", name)`, i.e. attached to the
+// main canvas exactly like OBS's own "+" button.
+//
+// `create_scene` (below) is kept anyway on its own merits: creating
+// scenes from inside OBS's own process is one fewer obs-websocket round
+// trip, and it degrades gracefully when this plugin isn't installed.
 crate::resolved_fn!(obs_scene_create: extern "C" fn(*const c_char) -> *mut ObsSceneT);
 crate::resolved_fn!(obs_scene_release: extern "C" fn(*mut ObsSceneT));
+
+// libobs/obs.h: `void obs_queue_task(enum obs_task_type type, obs_task_t
+// task, void *param, bool wait)`, where `obs_task_t` is
+// `void (*)(void *param)` and `enum obs_task_type`'s first variant is
+// `OBS_TASK_UI` (= 0, see `OBS_TASK_UI` below). With `wait = true` OBS
+// runs the task on its own UI thread and blocks the caller until it
+// returns — the sanctioned way for a plugin on a background thread to
+// touch frontend state. obs-websocket itself uses exactly this for
+// `SetStudioModeEnabled`; it just fails to for the getters below.
+crate::resolved_fn!(obs_queue_task: extern "C" fn(c_int, extern "C" fn(*mut c_void), *mut c_void, bool));
+// frontend/api/obs-frontend-api.h. Both getters return a *new strong
+// reference*, and both are genuinely nullable: `obs_frontend_get_current_
+// scene` resolves `main->programScene` (a weak ref that goes dead when the
+// program scene is deleted) in Studio Mode, or reads the scene-list
+// widget's current item otherwise, and the preview getter returns null
+// whenever Studio Mode is off. Resolved process-wide rather than against
+// libobs specifically — these live in `obs-frontend-api`, which
+// `platform::resolve` already searches on both platforms.
+crate::resolved_fn!(obs_frontend_get_current_scene: extern "C" fn() -> *mut ObsSourceT);
+crate::resolved_fn!(obs_frontend_get_current_preview_scene: extern "C" fn() -> *mut ObsSourceT);
+crate::resolved_fn!(obs_frontend_preview_program_mode_active: extern "C" fn() -> bool);
+
+/// `enum obs_task_type`'s first variant in libobs/obs.h — run on OBS's
+/// Qt UI thread.
+const OBS_TASK_UI: c_int = 0;
+
+// libobs/obs.h: `void obs_enum_outputs(bool (*enum_proc)(void *,
+// obs_output_t *), void *param)`. libobs holds its outputs mutex for the
+// whole enumeration, so an `obs_output_t*` handed to the callback stays
+// alive for that call — but only the output struct itself. See
+// `list_video_outputs` for what that does and doesn't make safe to read.
+crate::resolved_fn!(obs_enum_outputs: extern "C" fn(extern "C" fn(*mut c_void, *mut ObsOutputT) -> bool, *mut c_void));
+crate::resolved_fn!(obs_output_get_name: extern "C" fn(*const ObsOutputT) -> *const c_char);
+crate::resolved_fn!(obs_output_get_id: extern "C" fn(*const ObsOutputT) -> *const c_char);
+crate::resolved_fn!(obs_output_active: extern "C" fn(*const ObsOutputT) -> bool);
+crate::resolved_fn!(obs_output_get_flags: extern "C" fn(*const ObsOutputT) -> u32);
+
+/// `libobs/obs-output.h`: `#define OBS_OUTPUT_VIDEO (1 << 0)`.
+const OBS_OUTPUT_VIDEO: u32 = 1 << 0;
 // libobs/util/base.h — real signature is variadic
 // (`void blog(int log_level, const char *format, ...)`). Always called
 // here with a fixed "%s" format and exactly one string arg (`log_line`
@@ -689,6 +733,235 @@ fn handle_create_scene_impl(
     obs_data::set_bool(response_data, "ok", true);
 }
 
+/// Filled in on OBS's own UI thread by `read_current_scenes_on_ui_thread`,
+/// read back by `handle_get_current_scenes_impl` once `obs_queue_task`'s
+/// blocking wait returns.
+#[derive(Default)]
+struct CurrentScenes {
+    /// False if the task never ran at all — `obs_queue_task` logs and
+    /// returns without running anything when libobs has no UI task handler
+    /// registered. Keeps "OBS genuinely has no program scene" (a real,
+    /// reportable answer) distinguishable from "we never got to look"
+    /// (an error the caller must not mistake for the former).
+    ran: bool,
+    studio_mode: bool,
+    program: Option<String>,
+    preview: Option<String>,
+}
+
+/// Resolves one of the two nullable frontend scene getters to a name,
+/// releasing the strong reference it hands back. `None` covers both "OBS
+/// has no such scene right now" and "the symbol didn't resolve"; the
+/// caller separates those via `CurrentScenes::ran`.
+fn frontend_scene_name(getter: Option<extern "C" fn() -> *mut ObsSourceT>) -> Option<String> {
+    let getter = getter?;
+    let obs_source_get_name = obs_source_get_name()?;
+    let obs_source_release = obs_source_release()?;
+    let source = getter();
+    if source.is_null() {
+        return None;
+    }
+    let name = unsafe {
+        let ptr = obs_source_get_name(source);
+        if ptr.is_null() {
+            None
+        } else {
+            Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+        }
+    };
+    obs_source_release(source);
+    name
+}
+
+/// Runs on OBS's UI thread, via `obs_queue_task(OBS_TASK_UI, ...)`.
+/// `param` is a `*mut CurrentScenes` owned by the (blocked) caller for the
+/// whole duration of the task, so writing through it here is sound.
+extern "C" fn read_current_scenes_on_ui_thread(param: *mut c_void) {
+    ffi_guard(
+        "read_current_scenes_on_ui_thread",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            if param.is_null() {
+                return;
+            }
+            let out = unsafe { &mut *param.cast::<CurrentScenes>() };
+            out.ran = true;
+            out.studio_mode =
+                obs_frontend_preview_program_mode_active().is_some_and(|active| active());
+            out.program = frontend_scene_name(obs_frontend_get_current_scene());
+            out.preview = frontend_scene_name(obs_frontend_get_current_preview_scene());
+        }),
+    );
+}
+
+extern "C" fn handle_get_current_scenes(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_get_current_scenes",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_get_current_scenes_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{}`. Response: `{"ok": true, "studio_mode": bool}` plus
+/// `"program"`/`"preview"` *only when OBS actually has one* — an absent
+/// key means "no current scene", which is a normal state, not an error.
+///
+/// Exists because obs-websocket's own `GetCurrentProgramScene` and
+/// `GetCurrentPreviewScene` handlers pass `obs_frontend_get_current_scene()`
+/// / `..._preview_scene()` straight into `obs_source_get_name()` with no
+/// null check, then assign the result to a `json` value — which calls
+/// `strlen(nullptr)` and takes the whole OBS process down with SIGSEGV.
+/// Confirmed by symbolicating 23 identical crash reports against the
+/// shipped OBS 32.1.2 `obs-websocket` binary: the faulting frame is
+/// `_platform_strlen` inside the `GetCurrentProgramScene` handler, and the
+/// same missing check is present in the preview handler. Reproduces 100%
+/// of the time (not intermittently — this is a null deref, not a race)
+/// whenever OBS has no current program scene, e.g. right after the scene
+/// that *was* program is deleted.
+///
+/// So this handler does the two things obs-websocket's don't: null-check,
+/// and marshal onto the UI thread rather than reading the frontend's
+/// Qt-owned state from an obs-websocket worker thread.
+fn handle_get_current_scenes_impl(
+    _request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let response_data = obs_data::from_void(response_data);
+    let Some(obs_queue_task) = obs_queue_task() else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_queue_task unavailable");
+        return;
+    };
+
+    let mut scenes = CurrentScenes::default();
+    obs_queue_task(
+        OBS_TASK_UI,
+        read_current_scenes_on_ui_thread,
+        (&mut scenes as *mut CurrentScenes).cast(),
+        true,
+    );
+
+    if !scenes.ran {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "UI task handler unavailable");
+        return;
+    }
+    obs_data::set_bool(response_data, "ok", true);
+    obs_data::set_bool(response_data, "studio_mode", scenes.studio_mode);
+    if let Some(program) = &scenes.program {
+        obs_data::set_string(response_data, "program", program);
+    }
+    if let Some(preview) = &scenes.preview {
+        obs_data::set_string(response_data, "preview", preview);
+    }
+}
+
+/// Collects `{name, kind}` for every currently-active video output.
+/// `*mut c_void` param is a `&mut Vec<obs_data::NamedKind>` owned by
+/// `handle_list_video_outputs_impl` for the whole enumeration.
+extern "C" fn collect_video_output(param: *mut c_void, output: *mut ObsOutputT) -> bool {
+    ffi_guard(
+        "collect_video_output",
+        true,
+        std::panic::AssertUnwindSafe(|| {
+            if param.is_null() || output.is_null() {
+                return true;
+            }
+            let out = unsafe { &mut *param.cast::<Vec<obs_data::NamedKind>>() };
+            let active = obs_output_active().is_some_and(|active| active(output));
+            let flags = obs_output_get_flags().map_or(0, |get_flags| get_flags(output));
+            if !active || flags & OBS_OUTPUT_VIDEO == 0 {
+                return true;
+            }
+            let read = |getter: Option<extern "C" fn(*const ObsOutputT) -> *const c_char>| {
+                getter.and_then(|getter| unsafe {
+                    let ptr = getter(output);
+                    if ptr.is_null() {
+                        None
+                    } else {
+                        Some(CStr::from_ptr(ptr).to_string_lossy().into_owned())
+                    }
+                })
+            };
+            if let Some(name) = read(obs_output_get_name()) {
+                out.push(obs_data::NamedKind {
+                    name,
+                    kind: read(obs_output_get_id()).unwrap_or_default(),
+                });
+            }
+            true
+        }),
+    )
+}
+
+extern "C" fn handle_list_video_outputs(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_list_video_outputs",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_list_video_outputs_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{}`. Response: `{"ok": true, "outputs": [{"name", "kind"}]}`
+/// listing every *active video* output (the generic "is OBS's video
+/// pipeline in use" signal, covering plugin-added outputs like NDI's
+/// Main/Preview Output that the well-known streaming/recording checks
+/// miss).
+///
+/// Exists because obs-websocket's `GetOutputList` puts `outputWidth`/
+/// `outputHeight` on every entry, and `obs_output_get_width` resolves to
+/// `obs_encoder_get_width(output->video_encoders[i])` or
+/// `video_output_get_width(output->video)` — objects owned by the video
+/// subsystem, which `obs_reset_video` destroys. `obs_enum_outputs` holds
+/// libobs's outputs mutex, so the `obs_output_t` itself can't go away
+/// mid-enumeration, but that mutex says nothing about the encoder/video_t
+/// hanging off it. Changing video settings (in OBS's own Settings dialog
+/// *or* FrameSW's Preflight) while a client polls `GetOutputList` therefore
+/// dereferences freed memory and takes OBS down — confirmed from a real
+/// crash report: SIGSEGV in `obs_output_get_width`, called from
+/// obs-websocket's output-list handler on a worker thread.
+///
+/// So this reads only what the enumeration mutex actually protects:
+/// `obs_output_get_name`/`_get_id`/`_active`/`_get_flags` all touch just
+/// the `obs_output` struct. Width/height are never read at all — FrameSW
+/// only ever needed name and kind.
+fn handle_list_video_outputs_impl(
+    _request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let response_data = obs_data::from_void(response_data);
+    let Some(obs_enum_outputs) = obs_enum_outputs() else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_enum_outputs unavailable");
+        return;
+    };
+    let mut outputs: Vec<obs_data::NamedKind> = Vec::new();
+    obs_enum_outputs(
+        collect_video_output,
+        (&mut outputs as *mut Vec<obs_data::NamedKind>).cast(),
+    );
+    if !obs_data::set_pair_array(response_data, "outputs", &outputs) {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_data array symbols unavailable");
+        return;
+    }
+    obs_data::set_bool(response_data, "ok", true);
+}
+
 extern "C" fn handle_pause_rescan(
     request_data: *mut c_void,
     response_data: *mut c_void,
@@ -1007,6 +1280,8 @@ pub extern "C" fn obs_module_post_load() {
             ("start_audio_tap", handle_start_audio_tap as calldata::RequestCallbackFn),
             ("stop_audio_tap", handle_stop_audio_tap as calldata::RequestCallbackFn),
             ("create_scene", handle_create_scene as calldata::RequestCallbackFn),
+            ("get_current_scenes", handle_get_current_scenes as calldata::RequestCallbackFn),
+            ("list_video_outputs", handle_list_video_outputs as calldata::RequestCallbackFn),
             ("pause_rescan", handle_pause_rescan as calldata::RequestCallbackFn),
             ("resume_rescan", handle_resume_rescan as calldata::RequestCallbackFn),
             ("tap_status", handle_tap_status as calldata::RequestCallbackFn),

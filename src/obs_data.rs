@@ -103,6 +103,60 @@ pub fn build_levels_payload(levels: &[SourceLevel]) -> *mut ObsDataT {
     root
 }
 
+/// One `{name, kind}` pair for `set_pair_array`.
+pub struct NamedKind {
+    pub name: String,
+    pub kind: String,
+}
+
+/// Attaches `key: [{"name": ..., "kind": ...}, ...]` to an existing
+/// `obs_data_t*` (a vendor request's `response_data`, unlike
+/// `build_levels_payload`, which creates its own root). Returns false if
+/// any required `obs_data_*` symbol is unresolvable, so the caller can
+/// report a real error instead of silently answering with an empty list —
+/// "no active outputs" and "couldn't look" must stay distinguishable.
+pub fn set_pair_array(data: *mut ObsDataT, key: &str, items: &[NamedKind]) -> bool {
+    let (
+        Some(obs_data_create),
+        Some(obs_data_release),
+        Some(obs_data_set_string),
+        Some(obs_data_set_array),
+        Some(obs_data_array_create),
+        Some(obs_data_array_release),
+        Some(obs_data_array_push_back),
+    ) = (
+        self::obs_data_create(),
+        self::obs_data_release(),
+        self::obs_data_set_string(),
+        self::obs_data_set_array(),
+        self::obs_data_array_create(),
+        self::obs_data_array_release(),
+        self::obs_data_array_push_back(),
+    )
+    else {
+        return false;
+    };
+
+    let array = obs_data_array_create();
+    for item in items {
+        let entry = obs_data_create();
+        let name_key = cstr("name");
+        let name_val = cstr(&item.name);
+        obs_data_set_string(entry, name_key.as_ptr(), name_val.as_ptr());
+        let kind_key = cstr("kind");
+        let kind_val = cstr(&item.kind);
+        obs_data_set_string(entry, kind_key.as_ptr(), kind_val.as_ptr());
+        // Same refcount convention as `build_levels_payload`: push_back
+        // addrefs internally, so drop our own ref right after.
+        obs_data_array_push_back(array, entry);
+        obs_data_release(entry);
+    }
+    let array_key = cstr(key);
+    obs_data_set_array(data, array_key.as_ptr(), array);
+    obs_data_array_release(array);
+    true
+}
+
 pub fn release(data: *mut ObsDataT) {
     if data.is_null() {
         return;
