@@ -1297,6 +1297,55 @@ fn handle_projector_on_top_impl(
     obs_data::set_bool(response_data, "enabled", state.value);
 }
 
+extern "C" fn handle_rescan_now(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_rescan_now",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_rescan_now_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{}`. Response: `{"ok": true}`.
+///
+/// Runs one attach pass immediately instead of waiting for the periodic
+/// thread's next ~5s cycle. Exactly the same work that cycle already does,
+/// on the same (non-UI) thread — no new mechanism, it just removes the
+/// wait.
+///
+/// Why it matters: a source is only metered once an audio capture callback
+/// is attached to it, so for up to 5 seconds after FrameSW creates a shot
+/// that shot's meter reads silent even though audio is flowing. Usually a
+/// brief cosmetic lag; it becomes a real failure for anything checking a
+/// *newly created* input's level against a deadline, which is what made
+/// Preflight's Preview audio test fail (reported live 2026-08-01: "no real
+/// level arrived for this shot within 8s").
+///
+/// Honours `RESCAN_PAUSED`: if FrameSW has deliberately paused rescanning
+/// for its own scene setup, an explicit request doesn't override that.
+fn handle_rescan_now_impl(
+    _request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let response_data = obs_data::from_void(response_data);
+    if SHUTTING_DOWN.load(Ordering::Acquire) || RESCAN_PAUSED.load(Ordering::Acquire) {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "rescan paused or shutting down");
+        return;
+    }
+    if let Some(obs_enum_sources) = obs_enum_sources() {
+        obs_enum_sources(attach_callback_enum_proc, std::ptr::null_mut());
+    }
+    attach_scene_audio_taps();
+    obs_data::set_bool(response_data, "ok", true);
+}
+
 extern "C" fn handle_pause_rescan(
     request_data: *mut c_void,
     response_data: *mut c_void,
@@ -1619,6 +1668,7 @@ pub extern "C" fn obs_module_post_load() {
             ("list_video_outputs", handle_list_video_outputs as calldata::RequestCallbackFn),
             ("projector_on_top", handle_projector_on_top as calldata::RequestCallbackFn),
             ("ensure_profile", handle_ensure_profile as calldata::RequestCallbackFn),
+            ("rescan_now", handle_rescan_now as calldata::RequestCallbackFn),
             ("pause_rescan", handle_pause_rescan as calldata::RequestCallbackFn),
             ("resume_rescan", handle_resume_rescan as calldata::RequestCallbackFn),
             ("tap_status", handle_tap_status as calldata::RequestCallbackFn),
