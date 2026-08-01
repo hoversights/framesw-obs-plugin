@@ -58,6 +58,8 @@ pub enum ObsSourceT {}
 pub enum ObsSceneT {}
 /// Opaque — same story for `obs_output_t` (`libobs/obs.h`).
 pub enum ObsOutputT {}
+/// Opaque — same story for `config_t` (`libobs/util/config-file.h`).
+pub enum ConfigT {}
 
 /// `libobs/media-io/media-io-defs.h`: `#define MAX_AV_PLANES 8`.
 const MAX_AV_PLANES: usize = 8;
@@ -200,6 +202,32 @@ crate::resolved_fn!(obs_output_get_flags: extern "C" fn(*const ObsOutputT) -> u3
 
 /// `libobs/obs-output.h`: `#define OBS_OUTPUT_VIDEO (1 << 0)`.
 const OBS_OUTPUT_VIDEO: u32 = 1 << 0;
+
+// `frontend/api/obs-frontend-api.h`: `config_t *obs_frontend_get_user_config(void)`
+// — OBS's *live* user.ini config object, the same one OBS itself writes out
+// at exit. Going through it (rather than editing user.ini on disk) is what
+// makes a change stick: OBS holds these values in memory and rewrites the
+// file on close, so any external edit made while OBS runs is silently
+// clobbered. `obs_frontend_get_global_config` is the deprecated alias for
+// the same thing and is deliberately not used here.
+crate::resolved_fn!(obs_frontend_get_user_config: extern "C" fn() -> *mut ConfigT);
+// `libobs/util/config-file.h`.
+crate::resolved_fn!(config_get_bool: extern "C" fn(*mut ConfigT, *const c_char, *const c_char) -> bool);
+crate::resolved_fn!(config_set_bool: extern "C" fn(*mut ConfigT, *const c_char, *const c_char, bool));
+crate::resolved_fn!(config_save_safe: extern "C" fn(*mut ConfigT, *const c_char, *const c_char) -> c_int);
+
+/// user.ini's `[BasicWindow] ProjectorAlwaysOnTop` — OBS Settings ->
+/// General -> Projectors -> "Make projectors always on top". Verified
+/// against a real user.ini on 2026-08-01.
+///
+/// Deliberately app-global, NOT per-profile: OBS keeps it in user.ini, so
+/// it cannot be scoped to FrameSW's own profile the way video settings and
+/// the monitoring device can. Changing it follows the user into every
+/// other profile and scene collection they have — which is exactly why
+/// FrameSW exposes it as an explicit, clearly-labelled opt-in rather than
+/// setting it silently on connect.
+const PROJECTOR_ON_TOP_SECTION: &str = "BasicWindow";
+const PROJECTOR_ON_TOP_KEY: &str = "ProjectorAlwaysOnTop";
 // libobs/util/base.h — real signature is variadic
 // (`void blog(int log_level, const char *format, ...)`). Always called
 // here with a fixed "%s" format and exactly one string arg (`log_line`
@@ -962,6 +990,127 @@ fn handle_list_video_outputs_impl(
     obs_data::set_bool(response_data, "ok", true);
 }
 
+/// Carries the projector-on-top request across the UI-thread hop. `set`
+/// is `None` for a pure read.
+struct ProjectorOnTop {
+    ran: bool,
+    set: Option<bool>,
+    value: bool,
+}
+
+/// Runs on OBS's UI thread via `obs_queue_task(OBS_TASK_UI, ...)` — this
+/// touches the frontend's own config object, so it belongs on the thread
+/// that owns it, same reasoning as `read_current_scenes_on_ui_thread`.
+extern "C" fn projector_on_top_on_ui_thread(param: *mut c_void) {
+    ffi_guard(
+        "projector_on_top_on_ui_thread",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            if param.is_null() {
+                return;
+            }
+            let state = unsafe { &mut *param.cast::<ProjectorOnTop>() };
+            let (Some(get_user_config), Some(config_get_bool)) =
+                (obs_frontend_get_user_config(), config_get_bool())
+            else {
+                return;
+            };
+            let config = get_user_config();
+            if config.is_null() {
+                return;
+            }
+            let (Ok(section), Ok(key)) = (
+                CString::new(PROJECTOR_ON_TOP_SECTION),
+                CString::new(PROJECTOR_ON_TOP_KEY),
+            ) else {
+                return;
+            };
+
+            if let Some(desired) = state.set {
+                let Some(config_set_bool) = config_set_bool() else {
+                    return;
+                };
+                config_set_bool(config, section.as_ptr(), key.as_ptr(), desired);
+                // Persist now rather than relying on OBS's write-at-exit:
+                // a crash between here and shutdown would otherwise lose
+                // the change silently. `config_save_safe`'s temp/backup
+                // extensions match how OBS saves this file itself.
+                if let Some(config_save_safe) = config_save_safe() {
+                    let (Ok(tmp), Ok(bak)) = (CString::new("tmp"), CString::new("bak")) else {
+                        return;
+                    };
+                    config_save_safe(config, tmp.as_ptr(), bak.as_ptr());
+                }
+            }
+
+            state.value = config_get_bool(config, section.as_ptr(), key.as_ptr());
+            state.ran = true;
+        }),
+    );
+}
+
+extern "C" fn handle_projector_on_top(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_projector_on_top",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_projector_on_top_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{}` to read, or `{"enabled": true|false}` to set.
+/// Response: `{"ok": true, "enabled": bool}` — always the value as it
+/// stands *after* any set, so the caller never has to assume its write
+/// landed.
+///
+/// Reads/writes OBS Settings -> General -> Projectors -> "Make projectors
+/// always on top". See `PROJECTOR_ON_TOP_SECTION` for why this lives in
+/// the plugin at all: it's in user.ini, which obs-websocket exposes no
+/// request for, and which cannot be edited on disk while OBS is running
+/// without being clobbered at exit.
+///
+/// Note the change applies to projectors opened *after* it — OBS reads
+/// this when it creates a projector window, so any already-open projector
+/// keeps its current always-on-top state until reopened.
+fn handle_projector_on_top_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let Some(obs_queue_task) = obs_queue_task() else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_queue_task unavailable");
+        return;
+    };
+
+    let mut state = ProjectorOnTop {
+        ran: false,
+        set: obs_data::get_optional_bool(request_data, "enabled"),
+        value: false,
+    };
+    obs_queue_task(
+        OBS_TASK_UI,
+        projector_on_top_on_ui_thread,
+        (&mut state as *mut ProjectorOnTop).cast(),
+        true,
+    );
+
+    if !state.ran {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "user config unavailable");
+        return;
+    }
+    obs_data::set_bool(response_data, "ok", true);
+    obs_data::set_bool(response_data, "enabled", state.value);
+}
+
 extern "C" fn handle_pause_rescan(
     request_data: *mut c_void,
     response_data: *mut c_void,
@@ -1282,6 +1431,7 @@ pub extern "C" fn obs_module_post_load() {
             ("create_scene", handle_create_scene as calldata::RequestCallbackFn),
             ("get_current_scenes", handle_get_current_scenes as calldata::RequestCallbackFn),
             ("list_video_outputs", handle_list_video_outputs as calldata::RequestCallbackFn),
+            ("projector_on_top", handle_projector_on_top as calldata::RequestCallbackFn),
             ("pause_rescan", handle_pause_rescan as calldata::RequestCallbackFn),
             ("resume_rescan", handle_resume_rescan as calldata::RequestCallbackFn),
             ("tap_status", handle_tap_status as calldata::RequestCallbackFn),

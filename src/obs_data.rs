@@ -103,6 +103,30 @@ pub fn build_levels_payload(levels: &[SourceLevel]) -> *mut ObsDataT {
     root
 }
 
+// `libobs/obs-data.h`: `bool obs_data_get_bool(obs_data_t *data, const
+// char *name)` and `bool obs_data_has_user_value(obs_data_t *data, const
+// char *name)`. The presence check is required, not optional polish:
+// `obs_data_get_bool` returns `false` for a key that isn't there at all,
+// which would make "read the current value" indistinguishable from "set
+// it to false".
+crate::resolved_fn!(obs_data_get_bool: extern "C" fn(*mut ObsDataT, *const c_char) -> bool);
+crate::resolved_fn!(obs_data_has_user_value: extern "C" fn(*mut ObsDataT, *const c_char) -> bool);
+
+/// `Some(value)` only when the key is genuinely present; `None` for
+/// absent, so callers can distinguish "not supplied" from `false`.
+pub fn get_optional_bool(data: *mut ObsDataT, key: &str) -> Option<bool> {
+    let (Some(obs_data_get_bool), Some(obs_data_has_user_value)) =
+        (self::obs_data_get_bool(), self::obs_data_has_user_value())
+    else {
+        return None;
+    };
+    let key = cstr(key);
+    if !obs_data_has_user_value(data, key.as_ptr()) {
+        return None;
+    }
+    Some(obs_data_get_bool(data, key.as_ptr()))
+}
+
 /// One `{name, kind}` pair for `set_pair_array`.
 pub struct NamedKind {
     pub name: String,
