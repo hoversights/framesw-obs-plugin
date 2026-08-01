@@ -228,6 +228,29 @@ crate::resolved_fn!(config_save_safe: extern "C" fn(*mut ConfigT, *const c_char,
 /// setting it silently on connect.
 const PROJECTOR_ON_TOP_SECTION: &str = "BasicWindow";
 const PROJECTOR_ON_TOP_KEY: &str = "ProjectorAlwaysOnTop";
+
+// `frontend/api/obs-frontend-api.h` profile API. All three are verified
+// against OBS 32.1.2's own `OBSStudioAPI.cpp` implementation, and the
+// implementation detail is the entire reason `ensure_profile` exists:
+//
+// * `obs_frontend_set_current_profile` walks `main->ui->profileMenu`'s
+//   QActions and calls `action->trigger()` — raw Qt widget access with no
+//   marshalling whatsoever. Calling it off the UI thread (as obs-websocket's
+//   own `SetCurrentProfile` request does, from a pooled worker) touches Qt
+//   widgets from the wrong thread. It also simply does nothing when no
+//   action matches, which makes "try to switch, then read back" a safe
+//   existence check — no profile-list array to enumerate or free.
+// * `obs_frontend_duplicate_profile` posts `CreateDuplicateProfile` with
+//   Qt::AutoConnection, so it is *asynchronous* from a worker thread but
+//   *synchronous* from the UI thread. Running it on the UI thread is what
+//   makes it complete before returning instead of landing whenever.
+// * `obs_frontend_get_current_profile` returns `bstrdup(...)` — caller
+//   frees with `bfree`.
+crate::resolved_fn!(obs_frontend_get_current_profile: extern "C" fn() -> *mut c_char);
+crate::resolved_fn!(obs_frontend_set_current_profile: extern "C" fn(*const c_char));
+crate::resolved_fn!(obs_frontend_duplicate_profile: extern "C" fn(*const c_char));
+// `libobs/util/bmem.h` — frees what libobs allocated.
+crate::resolved_fn!(bfree: extern "C" fn(*mut c_void));
 // libobs/util/base.h — real signature is variadic
 // (`void blog(int log_level, const char *format, ...)`). Always called
 // here with a fixed "%s" format and exactly one string arg (`log_line`
@@ -990,6 +1013,169 @@ fn handle_list_video_outputs_impl(
     obs_data::set_bool(response_data, "ok", true);
 }
 
+/// Carries the `ensure_profile` request across the UI-thread hop.
+struct EnsureProfile {
+    ran: bool,
+    /// Profile to end up on.
+    wanted: String,
+    /// Whatever was current before — `None` if we were already on
+    /// `wanted`, so the caller can never record its own profile as the
+    /// user's.
+    previous: Option<String>,
+    /// True when the profile had to be created (by duplicating the user's).
+    created: bool,
+    /// Whether we genuinely ended up on `wanted`.
+    switched: bool,
+}
+
+/// Reads `obs_frontend_get_current_profile` into an owned `String`,
+/// freeing libobs's `bstrdup`'d buffer.
+fn current_profile_name() -> Option<String> {
+    let get = obs_frontend_get_current_profile()?;
+    let bfree = bfree()?;
+    let ptr = get();
+    if ptr.is_null() {
+        return None;
+    }
+    let name = unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() };
+    bfree(ptr.cast());
+    Some(name)
+}
+
+/// Runs on OBS's UI thread. Every step here is a Qt-touching frontend call
+/// that has no business running anywhere else — see the profile FFI block
+/// above.
+extern "C" fn ensure_profile_on_ui_thread(param: *mut c_void) {
+    ffi_guard(
+        "ensure_profile_on_ui_thread",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            if param.is_null() {
+                return;
+            }
+            let state = unsafe { &mut *param.cast::<EnsureProfile>() };
+            let Ok(wanted) = CString::new(state.wanted.as_str()) else {
+                return;
+            };
+            let Some(current) = current_profile_name() else {
+                return;
+            };
+            state.ran = true;
+
+            if current == state.wanted {
+                state.switched = true;
+                return;
+            }
+            state.previous = Some(current);
+
+            // Switching to a name that doesn't exist is a defined no-op
+            // (the menu walk matches nothing), so this doubles as the
+            // existence check.
+            if let Some(set_current) = obs_frontend_set_current_profile() {
+                set_current(wanted.as_ptr());
+            }
+            if current_profile_name().as_deref() == Some(state.wanted.as_str()) {
+                state.switched = true;
+                return;
+            }
+
+            // Didn't exist. Duplicating the *current* profile carries the
+            // user's whole configuration across in one atomic step —
+            // encoders, audio, recording path, stream key — rather than the
+            // handful of fields a caller could think to copy by hand, and
+            // with no second thread writing config behind OBS's back. It
+            // switches to the duplicate as part of the same operation.
+            let Some(duplicate) = obs_frontend_duplicate_profile() else {
+                return;
+            };
+            duplicate(wanted.as_ptr());
+            state.created = true;
+            state.switched = current_profile_name().as_deref() == Some(state.wanted.as_str());
+        }),
+    );
+}
+
+extern "C" fn handle_ensure_profile(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_ensure_profile",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_ensure_profile_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{"name": "FrameSW"}`. Response:
+/// `{"ok": true, "switched": bool, "created": bool}` plus `"previous"`
+/// when a switch genuinely happened.
+///
+/// Exists because doing this over obs-websocket crashes OBS. Reproduced
+/// live 2026-08-01: `CreateProfile` followed by seeding the new profile's
+/// settings killed OBS 1.5s into launch — SIGSEGV in `strcmp(NULL, ...)`
+/// on obs-websocket's pooled thread while OBS's main thread was inside
+/// `config_save_safe`, leaving a half-written 23-byte basic.ini. libobs's
+/// config layer does not tolerate a second thread writing config while OBS
+/// saves it, and obs-websocket's profile requests run on a worker thread.
+///
+/// Doing the whole thing on the UI thread removes that race rather than
+/// narrowing it: no delay, no retry, and the duplicate-then-switch happens
+/// synchronously in the same task.
+fn handle_ensure_profile_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let name = obs_data::get_string(request_data, "name").unwrap_or_default();
+    if name.is_empty() {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "missing profile name");
+        return;
+    }
+    let Some(obs_queue_task) = obs_queue_task() else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_queue_task unavailable");
+        return;
+    };
+
+    let mut state = EnsureProfile {
+        ran: false,
+        wanted: name,
+        previous: None,
+        created: false,
+        switched: false,
+    };
+    obs_queue_task(
+        OBS_TASK_UI,
+        ensure_profile_on_ui_thread,
+        (&mut state as *mut EnsureProfile).cast(),
+        true,
+    );
+
+    if !state.ran {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "profile frontend API unavailable");
+        return;
+    }
+    if state.created {
+        log_line(&format!(
+            "created profile '{}' by duplicating the active one",
+            state.wanted
+        ));
+    }
+    obs_data::set_bool(response_data, "ok", true);
+    obs_data::set_bool(response_data, "switched", state.switched);
+    obs_data::set_bool(response_data, "created", state.created);
+    if let Some(previous) = &state.previous {
+        obs_data::set_string(response_data, "previous", previous);
+    }
+}
+
 /// Carries the projector-on-top request across the UI-thread hop. `set`
 /// is `None` for a pure read.
 struct ProjectorOnTop {
@@ -1432,6 +1618,7 @@ pub extern "C" fn obs_module_post_load() {
             ("get_current_scenes", handle_get_current_scenes as calldata::RequestCallbackFn),
             ("list_video_outputs", handle_list_video_outputs as calldata::RequestCallbackFn),
             ("projector_on_top", handle_projector_on_top as calldata::RequestCallbackFn),
+            ("ensure_profile", handle_ensure_profile as calldata::RequestCallbackFn),
             ("pause_rescan", handle_pause_rescan as calldata::RequestCallbackFn),
             ("resume_rescan", handle_resume_rescan as calldata::RequestCallbackFn),
             ("tap_status", handle_tap_status as calldata::RequestCallbackFn),
