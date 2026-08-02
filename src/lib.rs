@@ -229,6 +229,23 @@ crate::resolved_fn!(config_save_safe: extern "C" fn(*mut ConfigT, *const c_char,
 const PROJECTOR_ON_TOP_SECTION: &str = "BasicWindow";
 const PROJECTOR_ON_TOP_KEY: &str = "ProjectorAlwaysOnTop";
 
+/// DistroAV (the NDI plugin) keeps its output switches in OBS's own
+/// user.ini under `[NDIPlugin]`, so the same live config object used for
+/// `projector_on_top` reaches them — verified against a real user.ini
+/// 2026-08-01.
+///
+/// These are the "Main Output"/"Preview Output" checkboxes in
+/// Tools -> NDI Output Settings. FrameSW's Audio Monitor listens to the NDI
+/// sources they produce ("... (OBS Program)" / "... (OBS Preview)"), so
+/// with both off that feature has nothing to connect to.
+///
+/// The keys exist whether or not DistroAV is installed — they're just inert
+/// without it, which is why the caller checks for the plugin separately
+/// rather than inferring it from a successful write here.
+const NDI_SECTION: &str = "NDIPlugin";
+const NDI_MAIN_OUTPUT_KEY: &str = "MainOutputEnabled";
+const NDI_PREVIEW_OUTPUT_KEY: &str = "PreviewOutputEnabled";
+
 // `frontend/api/obs-frontend-api.h` profile API. All three are verified
 // against OBS 32.1.2's own `OBSStudioAPI.cpp` implementation, and the
 // implementation detail is the entire reason `ensure_profile` exists:
@@ -1176,6 +1193,133 @@ fn handle_ensure_profile_impl(
     }
 }
 
+/// Carries an NDI-output request across the UI-thread hop. Either field
+/// `None` means "read this one, don't change it".
+struct NdiOutputs {
+    ran: bool,
+    set_main: Option<bool>,
+    set_preview: Option<bool>,
+    main: bool,
+    preview: bool,
+}
+
+/// Runs on OBS's UI thread — same reasoning as the projector handler: this
+/// touches the frontend's own live config object.
+extern "C" fn ndi_outputs_on_ui_thread(param: *mut c_void) {
+    ffi_guard(
+        "ndi_outputs_on_ui_thread",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            if param.is_null() {
+                return;
+            }
+            let state = unsafe { &mut *param.cast::<NdiOutputs>() };
+            let (Some(get_user_config), Some(config_get_bool)) =
+                (obs_frontend_get_user_config(), config_get_bool())
+            else {
+                return;
+            };
+            let config = get_user_config();
+            if config.is_null() {
+                return;
+            }
+            let (Ok(section), Ok(main_key), Ok(preview_key)) = (
+                CString::new(NDI_SECTION),
+                CString::new(NDI_MAIN_OUTPUT_KEY),
+                CString::new(NDI_PREVIEW_OUTPUT_KEY),
+            ) else {
+                return;
+            };
+
+            let mut wrote = false;
+            if let Some(config_set_bool) = config_set_bool() {
+                if let Some(v) = state.set_main {
+                    config_set_bool(config, section.as_ptr(), main_key.as_ptr(), v);
+                    wrote = true;
+                }
+                if let Some(v) = state.set_preview {
+                    config_set_bool(config, section.as_ptr(), preview_key.as_ptr(), v);
+                    wrote = true;
+                }
+            }
+            if wrote {
+                if let Some(config_save_safe) = config_save_safe() {
+                    let (Ok(tmp), Ok(bak)) = (CString::new("tmp"), CString::new("bak")) else {
+                        return;
+                    };
+                    config_save_safe(config, tmp.as_ptr(), bak.as_ptr());
+                }
+            }
+
+            state.main = config_get_bool(config, section.as_ptr(), main_key.as_ptr());
+            state.preview = config_get_bool(config, section.as_ptr(), preview_key.as_ptr());
+            state.ran = true;
+        }),
+    );
+}
+
+extern "C" fn handle_ndi_outputs(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_ndi_outputs",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_ndi_outputs_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{}` to read, or any of `{"main": bool, "preview": bool}` to
+/// set. Response: `{"ok": true, "main": bool, "preview": bool}` — always
+/// the values as they stand *after* any write.
+///
+/// See `NDI_SECTION` for why this lives in the plugin: DistroAV's switches
+/// are in OBS's user.ini, which obs-websocket exposes no request for and
+/// which can't be edited on disk while OBS runs without being clobbered.
+///
+/// Whether a change takes effect immediately or only for outputs started
+/// afterwards is DistroAV's business, not ours — the caller should read
+/// back rather than assume.
+fn handle_ndi_outputs_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let Some(obs_queue_task) = obs_queue_task() else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_queue_task unavailable");
+        return;
+    };
+
+    let mut state = NdiOutputs {
+        ran: false,
+        set_main: obs_data::get_optional_bool(request_data, "main"),
+        set_preview: obs_data::get_optional_bool(request_data, "preview"),
+        main: false,
+        preview: false,
+    };
+    obs_queue_task(
+        OBS_TASK_UI,
+        ndi_outputs_on_ui_thread,
+        (&mut state as *mut NdiOutputs).cast(),
+        true,
+    );
+
+    if !state.ran {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "user config unavailable");
+        return;
+    }
+    obs_data::set_bool(response_data, "ok", true);
+    obs_data::set_bool(response_data, "main", state.main);
+    obs_data::set_bool(response_data, "preview", state.preview);
+}
+
 /// Carries the projector-on-top request across the UI-thread hop. `set`
 /// is `None` for a pure read.
 struct ProjectorOnTop {
@@ -1668,6 +1812,7 @@ pub extern "C" fn obs_module_post_load() {
             ("list_video_outputs", handle_list_video_outputs as calldata::RequestCallbackFn),
             ("projector_on_top", handle_projector_on_top as calldata::RequestCallbackFn),
             ("ensure_profile", handle_ensure_profile as calldata::RequestCallbackFn),
+            ("ndi_outputs", handle_ndi_outputs as calldata::RequestCallbackFn),
             ("rescan_now", handle_rescan_now as calldata::RequestCallbackFn),
             ("pause_rescan", handle_pause_rescan as calldata::RequestCallbackFn),
             ("resume_rescan", handle_resume_rescan as calldata::RequestCallbackFn),
