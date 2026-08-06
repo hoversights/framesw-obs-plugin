@@ -97,9 +97,63 @@ starting with `[framesw]` to confirm it loaded.
 
 ## License
 
+Copyright (C) 2026 Hoversights.
+
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 2 of the License, or
-(at your option) any later version.
+(at your option) any later version — the same licence as OBS Studio
+itself.
 
-See [LICENSE](LICENSE) for the full text.
+See [LICENSE](LICENSE) for the full text. Every source file carries an
+`SPDX-License-Identifier: GPL-2.0-or-later` header and `Cargo.toml`
+declares the same, so source, package metadata and licence file all
+agree.
+
+### Licence and derivative-work boundary
+
+This plugin is GPL. **The FrameSW application is not, and is not a
+derivative work of it or of OBS.** The reasoning, stated plainly so it
+can be checked rather than taken on trust:
+
+- The plugin runs **inside** OBS's process and calls libobs, so it is
+  unambiguously bound by OBS's GPL. That is why it is GPL, and why its
+  source is here in full.
+- FrameSW is a **separate program in a separate process**. It links no
+  OBS code, includes no OBS headers, and is not linked against this
+  plugin. The two communicate only over
+  [obs-websocket](https://github.com/obsproject/obs-websocket)'s
+  documented network protocol — the same public, arms-length interface
+  used by Bitfocus Companion, Streamer.bot, Stream Deck integrations and
+  every other third-party OBS controller, commercial ones included.
+- The vendor requests this plugin exposes are part of that same
+  obs-websocket surface. They are not a private linkage channel, and any
+  obs-websocket client can call them.
+
+If you want to check that boundary, inspect the process and linkage
+model rather than this paragraph. Nothing in this repository is built
+into, or linked against, the FrameSW application binary.
+
+### Third-party licences
+
+The dependency tree is deliberately tiny, and is empty on macOS.
+
+| Dependency | Platform | Licence |
+|---|---|---|
+| `windows-sys`, `windows-targets`, and the eight `windows_*` target crates | Windows only | `MIT OR Apache-2.0` |
+
+Those are Microsoft's own `windows-rs` bindings, used for `platform.rs`'s
+symbol-resolution fallback (Windows has no `RTLD_DEFAULT` equivalent).
+They are dual-licensed and **this project elects the MIT option**, which
+is GPL-2.0 compatible. Apache-2.0 alone is *not* compatible with GPL-2.0,
+so the election is a real decision and is stated here deliberately rather
+than left for a reviewer to work out.
+
+macOS builds and all cross-platform logic use only the Rust standard
+library and raw FFI — no third-party crates at all.
+
+**No OBS source is vendored or redistributed here.** Every libobs and
+obs-websocket symbol is resolved at runtime against whatever OBS already
+has loaded (`dlsym` on macOS, `GetProcAddress` plus module enumeration on
+Windows), so there are no SDK headers, no generated bindings, and no
+copied OBS code in this repository.

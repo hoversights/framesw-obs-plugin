@@ -5,3 +5,7 @@ Cargo.lock.bak
 *.plugin/
 .DS_Store
 Thumbs.db
+
+# Local scratch: superseded plugin bundles kept while debugging an install
+# path. Never belongs in a public repo.
+old-plugin-backups/

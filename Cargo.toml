@@ -3,6 +3,15 @@ name = "framesw-obs-plugin"
 version = "0.2.0"
 edition = "2021"
 publish = false
+# GPL-2.0-or-later, matching OBS Studio's own licence. This plugin is loaded
+# into OBS's process and calls libobs, so it is bound by that. Declared here as
+# well as in LICENSE and the per-file SPDX headers, so `cargo metadata` and any
+# automated licence scanner agree with the source rather than finding nothing.
+# `version` above remains the single source of truth for both packaging
+# scripts' VERSION stamping - do not duplicate it elsewhere.
+license = "GPL-2.0-or-later"
+description = "OBS Studio plugin reporting real audio levels for Preview-only sources, plus monitor-speaker audio taps over NDI."
+repository = "https://github.com/hoversights/framesw-obs-plugin"
 
 # Loaded directly by OBS Studio's own process as a native module — not a
 # binary, not part of the main FrameSW app's build. Deliberately its own
