@@ -22,16 +22,50 @@ registered for this repo):
   deleted at the end of the job, `if: always()`, so signing material
   never lingers on disk past the run) using hardened runtime + a secure
   timestamp.
-- **windows**: builds the DLL via `package-windows.ps1`, unsigned. A
-  placeholder "Sign (pending Azure Trusted Signing)" step exists so
-  wiring up real signing later is a one-step change, not a new job.
+- **windows**: builds the DLL via `package-windows.ps1`, then signs it
+  with **Azure Artifact Signing** (the product formerly called Azure
+  Trusted Signing) using the `hoversights-public-trust` profile, and
+  verifies the result with `signtool verify /pa` before packaging. Both
+  the trusted-chain check and the presence of a timestamp are hard
+  build failures — see "Windows signing" below.
 
 Both jobs run `cargo test --locked` first. There are currently **zero
 unit tests** in this crate — this step is a no-op today, wired up so
-tests added later run automatically. Neither job runs `group.rs`'s
-`manage_group` vendor-request spike (`fbd8c43`) — that code path only
-executes inside a live OBS process reached over obs-websocket; nothing
-in CI simulates that, and nothing should.
+tests added later run automatically. No vendor request can be covered by
+CI regardless: those paths only execute inside a live OBS process
+reached over obs-websocket, nothing here simulates that, and nothing
+should.
+
+## Windows signing
+
+Signing runs on **every push**, matching the macOS job. There is no
+branch condition, deliberately — an unsigned artifact escaping unnoticed
+is the failure this exists to prevent.
+
+**The certificate profile must never be recreated.** SmartScreen
+reputation accrues to the signing identity, not to the publisher or the
+product. Deleting `hoversights-public-trust` and creating a replacement —
+even with an identical name and subject — restarts that reputation at
+zero, and users get "Windows protected your PC" again until it rebuilds.
+If signing looks broken, fix whatever consumes the profile. Note the
+profile in use today was itself created 2026-08-05, so its reputation is
+young; that is all the more reason not to reset it again.
+
+The profile is **Public Trust**, not "Public Trust Test" and not
+"Private Trust". The Test variant chains to a root Windows does not
+trust: it produces a signature that verifies under permissive flags but
+is rejected on a real user's machine — CI green, every download broken.
+That is why the verification step uses `/pa`, the same Default
+Authenticode Verification Policy Windows itself applies, rather than a
+weaker check that a Test-profile signature would pass.
+
+The timestamp check is separate and equally load-bearing. Artifact
+Signing issues certificates valid for only ~3 days by design; RFC-3161
+timestamping is what keeps an already-shipped binary trusted afterwards.
+An untimestamped signature passes `/pa` on the day it is made and starts
+failing days later, long after the run went green — so the workflow
+asserts a timestamp is present rather than assuming the signing step
+attached one.
 
 The Rust toolchain version is pinned via `rust-toolchain.toml` at the
 repo root (not floating `stable`) — rustup resolves it automatically on
@@ -118,6 +152,33 @@ app repo:
 | `MACOS_CERTIFICATE` | The Developer ID Application `.p12`, base64-encoded (`base64 -i cert.p12 \| pbcopy` on macOS) |
 | `MACOS_CERTIFICATE_PWD` | The password used when exporting that `.p12` |
 | `KEYCHAIN_PASSWORD` | Any password of your choosing — only ever used to lock/unlock the throwaway keychain created and destroyed within a single job run; not tied to any existing credential |
+| `AZURE_TENANT_ID` | The Azure AD tenant (directory) ID for the `hoversights` signing account |
+| `AZURE_CLIENT_ID` | Application (client) ID of the CI service principal |
+| `AZURE_CLIENT_SECRET` | That service principal's client secret |
 
-No secret is needed for Windows — that job builds unsigned by design
-until Azure Trusted Signing lands.
+**The three Azure values require a service principal, which the local
+Windows box does not use.** Local release builds authenticate with an
+interactive `az login` as the subscription's own user; a CI runner
+cannot. Create one and grant it the signing role:
+
+```sh
+az ad sp create-for-rbac --name framesw-plugin-signing-ci
+# note appId -> AZURE_CLIENT_ID, password -> AZURE_CLIENT_SECRET,
+#      tenant -> AZURE_TENANT_ID
+
+# Then, on the `hoversights` signing account, assign the role:
+#   "Artifact Signing Certificate Profile Signer"
+# Search IAM for "artifact" — the role was renamed from
+# "Trusted Signing Certificate Profile Signer" and a search for
+# "trusted" returns nothing.
+```
+
+Scope the role assignment to the signing account, not the whole
+subscription. Rotate `AZURE_CLIENT_SECRET` on its own expiry — a signing
+failure that starts on a specific date with an auth error is almost
+always this, not a broken profile, and the fix is a new secret rather
+than anything touching the certificate.
+
+The endpoint, account name and certificate profile name are **not**
+secrets and are in the workflow in clear text. They identify which
+profile signed a binary, which anyone can read out of the signature.

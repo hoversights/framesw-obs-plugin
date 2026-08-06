@@ -4,10 +4,16 @@ name: Build
 # here: this is a public repo, and those triggers run workflow code
 # against whatever a fork's PR branch contains. That's fine on a
 # GitHub-hosted runner (each run is a throwaway VM), but it's a standing
-# invitation for a malicious PR to exfiltrate this job's secrets
-# (the Developer ID cert + its password) the moment anyone adds a
-# secrets-consuming step to a fork-triggered workflow. Keep signing and
-# `pull_request` permanently separated in this repo.
+# invitation for a malicious PR to exfiltrate this job's secrets the
+# moment anyone adds a secrets-consuming step to a fork-triggered
+# workflow. Keep signing and `pull_request` permanently separated in
+# this repo.
+#
+# The stakes rose on 2026-08-06: this workflow now holds BOTH the Apple
+# Developer ID cert (+ password) and an Azure service principal that can
+# sign anything as Hoversights. A leak of the latter lets someone sign
+# malware with our public-trust identity — which would burn the
+# SmartScreen reputation permanently, not just require a key rotation.
 on:
   push:
 
@@ -33,12 +39,11 @@ jobs:
 
       # Zero unit tests exist in this crate today (verified — no #[test]
       # anywhere in src/). This step is wired up anyway so tests added
-      # later run automatically; it's a no-op until then. This does NOT
-      # exercise `group.rs`'s `manage_group` vendor-request spike
-      # (fbd8c43) — that code path only ever runs inside a live OBS
-      # process that calls it over obs-websocket, and nothing here can
-      # or should simulate that. Do not add an integration test that
-      # tries to spin up real OBS in CI for this.
+      # later run automatically; it's a no-op until then. Note that no
+      # vendor request can be covered here regardless: those code paths
+      # only ever run inside a live OBS process calling them over
+      # obs-websocket, and nothing in CI can or should simulate that. Do
+      # not add an integration test that tries to spin up real OBS.
       - name: Run unit tests
         run: cargo test --locked --target aarch64-apple-darwin
 
@@ -145,20 +150,92 @@ jobs:
       - name: Build plugin DLL
         run: powershell -NoProfile -File package-windows.ps1
 
-      # Deliberately empty — do NOT implement Windows signing yet, Azure
-      # Trusted Signing is still pending (see PROJECT_OVERVIEW.md /
-      # CLAUDE.md in the app repo). Once a real cert/config exists,
-      # replace this step's body with the actual signing invocation
-      # (matching whatever the app repo's package-windows.ps1 lands on
-      # for its own -AzureSign path) — no other workflow changes should
-      # be needed, the artifact step below already just zips whatever
-      # package-windows.ps1 produced.
-      - name: Sign (pending Azure Trusted Signing)
+      # Azure Artifact Signing — the product formerly called Azure Trusted
+      # Signing. Microsoft renamed it, which is also why the IAM role is
+      # "Artifact Signing Certificate Profile Signer" and why searching
+      # the portal for "trusted" finds nothing.
+      #
+      # `endpoint`, `trusted-signing-account-name` and
+      # `certificate-profile-name` are NOT secrets and are deliberately in
+      # the clear: they identify which profile signed a binary, which
+      # anyone can read out of the signature anyway. Only the service
+      # principal's three credentials are secret.
+      #
+      # ─── DO NOT EVER RECREATE THE CERTIFICATE PROFILE ────────────────
+      # SmartScreen reputation accrues to a signing identity, not to the
+      # publisher or the product. Deleting `hoversights-public-trust` and
+      # creating a new profile — even one with an identical name and
+      # subject — restarts that reputation from zero, and every user sees
+      # "Windows protected your PC" again until it rebuilds. This has
+      # bitten other developers. If something looks wrong with signing,
+      # fix whatever consumes the profile; never delete and recreate it.
+      # ─────────────────────────────────────────────────────────────────
+      #
+      # PUBLIC TRUST profile, explicitly. "Public Trust Test" chains to a
+      # test root that Windows does not trust — it yields a signature
+      # which verifies under the right flags but is rejected on a real
+      # user's machine. That is the worst available failure mode, because
+      # CI would go green while every download stayed broken. "Private
+      # Trust" is for enterprise-internal allow-listing and is equally
+      # wrong here.
+      #
+      # Signs on every push, matching the macOS job. An unsigned artifact
+      # escaping unnoticed is the exact failure this prevents, so there is
+      # deliberately no branch condition.
+      - name: Sign plugin DLL (Azure Artifact Signing)
+        uses: Azure/artifact-signing-action@v2
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: https://wus2.codesigning.azure.net/
+          trusted-signing-account-name: hoversights
+          certificate-profile-name: hoversights-public-trust
+          files-folder: ${{ github.workspace }}\target\framesw-companion\bin\64bit
+          files-folder-filter: dll
+          file-digest: SHA256
+          # Timestamping is what makes these signatures outlive the
+          # certificate, which Artifact Signing deliberately issues with
+          # only ~3 days of validity. Without it, every shipped build
+          # would stop validating within days. The action already defaults
+          # to this URL; set explicitly so nobody removes it believing it
+          # to be optional.
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # Verifying separately, rather than trusting the signing step's exit
+      # code, is deliberate: that step succeeding means "the service
+      # accepted the request", not "the artifact a user downloads will
+      # validate on their machine".
+      - name: Verify signature
+        shell: powershell
         run: |
-          # TODO(Azure Trusted Signing): once the cert/credentials exist,
-          # sign target\framesw-companion\bin\64bit\framesw-companion.dll
-          # here. Tracked as pending in CLAUDE.md; do not block on it.
-          Write-Host "Windows signing not yet implemented - Azure Trusted Signing is still pending. Artifact below is UNSIGNED."
+          $ErrorActionPreference = "Stop"
+          $Dll = "target\framesw-companion\bin\64bit\framesw-companion.dll"
+          if (-not (Test-Path $Dll)) { throw "DLL not found at $Dll" }
+
+          # signtool ships with the Windows SDK and is not on PATH on the
+          # hosted runner. Take the highest-versioned x64 copy present.
+          $SignTool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $SignTool) { throw "signtool.exe not found on this runner" }
+          Write-Host "Using $($SignTool.FullName)"
+
+          # /pa = Default Authenticode Verification Policy: the same
+          # policy Windows itself applies to a downloaded binary.
+          $Output = & $SignTool.FullName verify /pa /v $Dll 2>&1 | Out-String
+          Write-Host $Output
+          if ($LASTEXITCODE -ne 0) {
+              throw "signtool verify /pa FAILED - the artifact is not trusted"
+          }
+
+          # Checked explicitly rather than assumed: an untimestamped
+          # signature passes /pa today and begins failing in ~3 days, long
+          # after CI went green.
+          if ($Output -notmatch "(?i)timestamp") {
+              throw "Signature carries NO timestamp - it would stop validating once the certificate expires"
+          }
+          Write-Host "Verified: trusted chain + timestamp present."
 
       - name: Package artifact
         id: package
