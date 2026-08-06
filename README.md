@@ -48,9 +48,64 @@ Runtime](https://ndi.video/tools/) to be installed (FrameSW bundles it);
 without it, taps simply produce no audio — the rest of the plugin is
 unaffected.
 
+## Vendor requests — the complete list
+
+The plugin registers as obs-websocket vendor `framesw` and exposes 15
+requests. Any obs-websocket client can call them; they are not private to
+FrameSW.
+
+**Four of them change your OBS.** They are listed first and marked, because
+if you install this from a plugin directory you should know that before you
+do, not after.
+
+### Requests that modify OBS state
+
+| Request | What it does |
+|---|---|
+| `create_scene` | Creates a scene by name. Idempotent — succeeds if it already exists. |
+| `ensure_profile` | Creates an OBS **Profile** if missing and switches to it. Runs on OBS's UI thread deliberately: doing this over obs-websocket's pooled thread raced `config_save_safe` and left a half-written `basic.ini`. |
+| `projector_on_top` | Toggles OBS's "projectors always on top" setting, which lives in `user.ini`. Exposed here because obs-websocket has no request for it and the file cannot be safely edited on disk while OBS is running. |
+| `ndi_outputs` | Reads and sets DistroAV's Main/Preview NDI output switches, also in `user.ini`, for the same reason. No effect if DistroAV is not installed. |
+
+### Read-only requests
+
+| Request | What it does |
+|---|---|
+| `get_current_scenes` | Returns the current Program and Preview scene names. Exists because obs-websocket's own `GetCurrentProgramScene` calls `strlen()` on a null pointer and **crashes OBS** when there is no current scene — which is exactly the state left behind when the Program scene is deleted. Filed upstream as obsproject/obs-websocket#1349. |
+| `list_video_outputs` | Returns the output list. Same motivation: obs-websocket's `GetOutputList` reads output dimensions through pointers `obs_reset_video` has freed, taking OBS down with a SIGSEGV. |
+| `tap_status` | Whether a given audio tap bus is active. |
+| `mix_status` | Whether a mix bus is active, and which sources it carries. |
+
+### Audio monitoring
+
+These forward a **copy** of audio the plugin already reads for metering out
+to an NDI sender. They never touch OBS's own routing, so they cannot alter
+what is streamed or recorded.
+
+| Request | What it does |
+|---|---|
+| `start_audio_tap` / `stop_audio_tap` | Start/stop forwarding one source's audio to an NDI sender named `FrameSW-Monitor-{bus_id}`. |
+| `set_mix_sources` / `stop_mix_bus` | Same, for a mixed bus of several sources. |
+
+### Plugin-internal
+
+These affect only this plugin's own bookkeeping, never OBS.
+
+| Request | What it does |
+|---|---|
+| `rescan_now` | Attach audio callbacks immediately rather than waiting for the periodic pass, so a just-created input meters straight away. |
+| `pause_rescan` / `resume_rescan` | Suspend the periodic attach pass while a client is recreating its own scenes. |
+
 ## Requirements
 
-- **OBS Studio 30.2 or newer**.
+- **OBS Studio.** The module declares compatibility with **30.0 and
+  newer** (`obs_module_ver`), which is deliberately conservative: every
+  libobs call it makes has been stable API for years, and a module that
+  claims a version *newer* than its host is hard-rejected at load. In
+  practice it has been **run and verified against 32.1.2 and 32.2.x
+  only** — anything between 30.0 and 32.1 should work but is untested, so
+  please report rather than assume. On macOS note that OBS 32.2.0+ itself
+  requires macOS 13; on macOS 12 the correct OBS build is 32.1.2.
 - **obs-websocket** (bundled with OBS Studio by default since 28.0) if
   you want the audio-levels data actually forwarded anywhere — the
   plugin loads and runs without it, it just has nowhere to send data.

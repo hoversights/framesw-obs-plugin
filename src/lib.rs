@@ -1731,6 +1731,27 @@ fn obs_module_ver_impl() -> u32 {
     30u32 << 24
 }
 
+/// Human-readable name OBS shows in its UI and writes to its log. Without
+/// these two exports OBS has no name for the module at all and falls back
+/// to the bare filename, which is unhelpful in a crash log and looks
+/// unfinished in a plugin listing.
+///
+/// Returned as a `'static` C string: OBS only reads it, never frees it.
+#[no_mangle]
+pub extern "C" fn obs_module_name() -> *const c_char {
+    ffi_guard("obs_module_name", std::ptr::null(), || {
+        c"FrameSW Companion".as_ptr()
+    })
+}
+
+/// One-line description, shown alongside the name.
+#[no_mangle]
+pub extern "C" fn obs_module_description() -> *const c_char {
+    ffi_guard("obs_module_description", std::ptr::null(), || {
+        c"Reports real audio levels for Preview-only sources, and provides monitor-speaker audio taps over NDI.".as_ptr()
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn obs_module_load() -> bool {
     ffi_guard("obs_module_load", false, || {
