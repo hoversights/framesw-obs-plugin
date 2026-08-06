@@ -54,7 +54,6 @@ use std::sync::Mutex;
 
 mod audio_tap;
 mod calldata;
-mod group;
 mod ndi_ffi;
 mod obs_data;
 mod platform;
@@ -615,68 +614,9 @@ fn spawn_periodic_rescan() {
 }
 
 // ---------------------------------------------------------------------
-// SPIKE (throwaway): a single vendor *request* proving the plugin can
-// create/manage real OBS groups (`group.rs`) — commanded from FrameSW
-// via obs-websocket's `CallVendorRequest`, since group manipulation has
-// no obs-websocket request of its own. Not wired into shot-creation.
-// ---------------------------------------------------------------------
-
-extern "C" fn handle_manage_group(
-    request_data: *mut c_void,
-    response_data: *mut c_void,
-    priv_data: *mut c_void,
-) {
-    ffi_guard(
-        "handle_manage_group",
-        (),
-        std::panic::AssertUnwindSafe(|| {
-            handle_manage_group_impl(request_data, response_data, priv_data)
-        }),
-    );
-}
-
-/// Request shape: `{"action": "create"|"add_item"|"remove_item"|"lock"|
-/// "unlock", "scene": "PGM-A", "group": "Layer 1", "source": "..."}`
-/// (`source` only meaningful for `add_item`/`remove_item`). Response:
-/// `{"ok": true}` or `{"ok": false, "error": "..."}` — deliberately the
-/// simplest shape that lets a demo caller tell success from failure and
-/// read *why*, not a designed-for-production API.
-fn handle_manage_group_impl(
-    request_data: *mut c_void,
-    response_data: *mut c_void,
-    _priv_data: *mut c_void,
-) {
-    let request_data = obs_data::from_void(request_data);
-    let response_data = obs_data::from_void(response_data);
-
-    let action = obs_data::get_string(request_data, "action").unwrap_or_default();
-    let scene = obs_data::get_string(request_data, "scene").unwrap_or_default();
-    let group = obs_data::get_string(request_data, "group").unwrap_or_default();
-    let source = obs_data::get_string(request_data, "source").unwrap_or_default();
-
-    let result = match action.as_str() {
-        "create" => group::create_group(&scene, &group),
-        "add_item" => group::add_item_to_group(&scene, &group, &source),
-        "remove_item" => group::remove_item_from_group(&scene, &group, &source),
-        "lock" => group::set_group_locked(&scene, &group, true),
-        "unlock" => group::set_group_locked(&scene, &group, false),
-        other => Err(format!("unknown action '{other}'")),
-    };
-
-    match result {
-        Ok(()) => obs_data::set_bool(response_data, "ok", true),
-        Err(e) => {
-            log_line(&format!("manage_group action='{action}' failed: {e}"));
-            obs_data::set_bool(response_data, "ok", false);
-            obs_data::set_string(response_data, "error", &e);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------
-// PROMPT 17: monitor-speaker audio taps (`audio_tap.rs`/`ndi_ffi.rs`) —
-// three vendor requests mirroring `manage_group`'s own shape/pattern
-// (FrameSW's request, this plugin's response, `{"ok": bool, "error":
+// Monitor-speaker audio taps (`audio_tap.rs`/`ndi_ffi.rs`) — three vendor
+// requests following this plugin's standard shape (FrameSW's request,
+// this plugin's response, `{"ok": bool, "error":
 // string}` on failure). All three are idempotent per `audio_tap.rs`'s
 // own doc comments — safe for FrameSW to call repeatedly, e.g. on every
 // OBS reconnect's reconciliation pass, without needing to track "did I
@@ -1816,12 +1756,6 @@ pub extern "C" fn obs_module_post_load() {
         VENDOR.store(vendor, Ordering::Release);
         log_line("registered as obs-websocket vendor \"framesw\" — forwarding audio levels");
         spawn_emit_loop();
-        // SPIKE: see `handle_manage_group`'s doc comment.
-        if calldata::register_request(vendor, "manage_group", handle_manage_group) {
-            log_line("registered vendor request \"manage_group\" (spike — group management)");
-        } else {
-            log_line("failed to register vendor request \"manage_group\"");
-        }
         for (request_type, callback) in [
             ("start_audio_tap", handle_start_audio_tap as calldata::RequestCallbackFn),
             ("stop_audio_tap", handle_stop_audio_tap as calldata::RequestCallbackFn),
