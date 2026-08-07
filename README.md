@@ -162,14 +162,15 @@ their own.
 
 This plugin was written with substantial use of AI coding tools (Claude).
 They were used for implementation, refactoring and test-writing
-throughout.
+throughout. Direction, testing and release engineering are the
+maintainer's; much of the implementation was AI-assisted.
 
-All code is reviewed, built, signed and tested against real OBS
-installations on macOS and Windows before release by the maintainer, who
-also handles bug reports. The complete source is GPL-2.0-or-later and
-public here, and every vendor request the plugin registers -- including
-each one that modifies OBS state -- is documented above rather than left
-to be discovered by reading the code.
+It is actively maintained. Every release is built, signed and tested
+against real OBS installations on macOS and Windows before it ships, and
+reported bugs are triaged and answered. The complete source is
+GPL-2.0-or-later and public here, every vendor request the plugin
+registers is documented above -- including each one that modifies OBS
+state -- and the commit history records what changed and why.
 
 ## License
 
