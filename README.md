@@ -150,6 +150,27 @@ relaunch OBS Studio:
 Check OBS's own log (Help → Log Files → View Current Log) for a line
 starting with `[framesw]` to confirm it loaded.
 
+## Reporting problems
+
+Open an issue on this repository's GitHub tracker. Include your OBS
+version, your platform, and the `[framesw]` lines from OBS's own log
+(Help -> Log Files -> View Current Log) -- the plugin logs the reason for
+every failure it can detect, so those lines usually identify the cause on
+their own.
+
+## Development disclosure
+
+This plugin was written with substantial use of AI coding tools (Claude).
+They were used for implementation, refactoring and test-writing
+throughout.
+
+All code is reviewed, built, signed and tested against real OBS
+installations on macOS and Windows before release by the maintainer, who
+also handles bug reports. The complete source is GPL-2.0-or-later and
+public here, and every vendor request the plugin registers -- including
+each one that modifies OBS state -- is documented above rather than left
+to be discovered by reading the code.
+
 ## License
 
 Copyright (C) 2026 Hoversights.
