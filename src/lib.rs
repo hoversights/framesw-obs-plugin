@@ -517,55 +517,119 @@ fn attach_callback_enum_proc_impl(_param: *mut c_void, source: *mut ObsSourceT) 
 /// `attach_callback_enum_proc` does for individual shot inputs — this is
 /// the only reason Main Audio Out's real metering used to depend on OBS's
 /// NDI Main/Preview Output at all.
-const PROGRAM_PREVIEW_SCENE_NAMES: [&str; 2] = ["PGM-A", "PGM-B"];
+/// The scene each role is currently tapped on, so a role that moves to a
+/// different scene detaches from the old one.
+///
+/// Under the previous fixed-name scheme this could not happen: the taps sat
+/// on `PGM-A`/`PGM-B` forever. Resolving by role means the underlying scene
+/// changes whenever the operator switches, and attaching without detaching
+/// would leave a live audio callback on every scene that was ever Program —
+/// growing for the life of the OBS session and reporting levels for scenes
+/// that are no longer on air.
+static ATTACHED_PROGRAM_SCENE: Mutex<Option<String>> = Mutex::new(None);
+static ATTACHED_PREVIEW_SCENE: Mutex<Option<String>> = Mutex::new(None);
 
-/// Logged once per scene name the first time it's found, not every 5s
-/// rescan — a direct, checkable confirmation (matching this plugin's
-/// existing "check OBS's log" verification method) that the scene tap is
-/// actually attached, independent of whether FrameSW's own meters are
-/// showing anything (e.g. nothing audible is on Program/Preview yet).
-static PGM_A_FOUND_LOGGED: AtomicBool = AtomicBool::new(false);
-static PGM_B_FOUND_LOGGED: AtomicBool = AtomicBool::new(false);
-
-/// Looks up FrameSW's two fixed scene names directly (`obs_enum_sources`
-/// can't reach them — confirmed it filters to `OBS_SOURCE_TYPE_INPUT`
-/// only, excluding scenes entirely) and attaches the same audio capture
-/// callback used for regular sources. The looked-up reference is released
-/// immediately after attaching — the callback registration itself doesn't
-/// need the reference held past this call, only the scene's own existence
-/// for as long as OBS keeps it in the scene collection. Harmless to call
-/// repeatedly (same re-attach-is-idempotent-enough reasoning as
-/// `attach_callback_enum_proc`'s own periodic re-invocation); a no-op
-/// until FrameSW has actually connected and created these scenes.
+/// Attaches the composited-mix audio callback to whichever scenes OBS
+/// currently reports as **Program and Preview**, by role.
+///
+/// Previously this looked up two hardcoded names, `PGM-A` and `PGM-B` —
+/// FrameSW's own scene naming baked into the metering path. In any OBS that
+/// is not running a FrameSW show those scenes do not exist, so scene-level
+/// metering silently did nothing. Resolving by role makes it correct
+/// everywhere, FrameSW included: FrameSW's Program and Preview really are
+/// PGM-A/PGM-B, so the same two scenes are found, but because they hold the
+/// role rather than because of their names.
+///
+/// **The frontend read is marshalled onto OBS's UI thread**, reusing the
+/// same `read_current_scenes_on_ui_thread` task the `get_current_scenes`
+/// vendor request uses. That is not incidental: this function runs on the
+/// periodic rescan thread and on obs-websocket request threads, and reading
+/// the frontend's Qt-owned scene state from a worker thread is exactly the
+/// pattern this plugin exists to avoid — see
+/// `handle_get_current_scenes_impl`'s own comment. The task is tiny (two
+/// getters and two name copies) and only runs every ~5s.
+///
+/// `obs_enum_sources` cannot reach scenes at all (confirmed: it filters to
+/// `OBS_SOURCE_TYPE_INPUT`), which is why they need this separate path.
 fn attach_scene_audio_taps() {
-    let (Some(obs_get_source_by_name), Some(obs_source_add_audio_capture_callback), Some(obs_source_release)) = (
+    let Some(obs_queue_task) = obs_queue_task() else {
+        return;
+    };
+    let mut scenes = CurrentScenes::default();
+    obs_queue_task(
+        OBS_TASK_UI,
+        read_current_scenes_on_ui_thread,
+        (&mut scenes as *mut CurrentScenes).cast(),
+        true,
+    );
+    if !scenes.ran {
+        return; // UI task handler unavailable — try again next cycle
+    }
+    attach_role_tap("program", scenes.program.as_deref(), &ATTACHED_PROGRAM_SCENE);
+    attach_role_tap("preview", scenes.preview.as_deref(), &ATTACHED_PREVIEW_SCENE);
+}
+
+/// Moves one role's audio tap to `scene`, detaching from whatever that role
+/// was tapped on before.
+///
+/// Re-attaching to the same scene is deliberately still done every cycle:
+/// it is the same remove-then-add idempotency `attach_callback_enum_proc`
+/// relies on, and it re-establishes the tap if OBS destroyed and recreated
+/// the scene under the same name. Only the *logging* is suppressed for an
+/// unchanged scene, so the log records role changes rather than repeating
+/// every 5 seconds.
+fn attach_role_tap(role: &str, scene: Option<&str>, attached: &Mutex<Option<String>>) {
+    let (Some(get_by_name), Some(add_cb), Some(release)) = (
         obs_get_source_by_name(),
         obs_source_add_audio_capture_callback(),
         obs_source_release(),
     ) else {
         return;
     };
-    for (name, logged) in PROGRAM_PREVIEW_SCENE_NAMES
-        .iter()
-        .zip([&PGM_A_FOUND_LOGGED, &PGM_B_FOUND_LOGGED])
-    {
-        let Ok(cname) = CString::new(*name) else {
-            continue;
-        };
-        let source = obs_get_source_by_name(cname.as_ptr());
-        if source.is_null() {
-            continue; // not created yet (or this OBS session isn't a FrameSW show)
+    let remove_cb = obs_source_remove_audio_capture_callback();
+
+    let mut attached = match attached.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let changed = attached.as_deref() != scene;
+
+    // Detach from the scene this role has moved off, or from the scene it
+    // held when the role went away entirely (no Program scene at all is a
+    // real OBS state — see handle_get_current_scenes_impl).
+    if changed {
+        if let (Some(old), Some(remove)) = (attached.as_deref(), remove_cb) {
+            if let Ok(cold) = CString::new(old) {
+                let src = get_by_name(cold.as_ptr());
+                if !src.is_null() {
+                    remove(src, audio_capture_callback, std::ptr::null_mut());
+                    release(src);
+                }
+            }
         }
-        // Same remove-then-add idempotency as attach_callback_enum_proc.
-        if let Some(remove) = obs_source_remove_audio_capture_callback() {
-            remove(source, audio_capture_callback, std::ptr::null_mut());
-        }
-        obs_source_add_audio_capture_callback(source, audio_capture_callback, std::ptr::null_mut());
-        obs_source_release(source);
-        if !logged.swap(true, Ordering::AcqRel) {
-            log_line(&format!("attached real audio tap to scene '{name}'"));
-        }
+        *attached = None;
     }
+
+    let Some(scene) = scene else {
+        return;
+    };
+    let Ok(cname) = CString::new(scene) else {
+        return;
+    };
+    let source = get_by_name(cname.as_ptr());
+    if source.is_null() {
+        return; // named scene not present yet
+    }
+    if let Some(remove) = remove_cb {
+        remove(source, audio_capture_callback, std::ptr::null_mut());
+    }
+    add_cb(source, audio_capture_callback, std::ptr::null_mut());
+    release(source);
+
+    if changed {
+        log_line(&format!("attached real audio tap to {role} scene '{scene}'"));
+    }
+    *attached = Some(scene.to_string());
 }
 
 /// Periodically re-enumerates and (re-)attaches the callback, rather than
