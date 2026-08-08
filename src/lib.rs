@@ -292,7 +292,7 @@ crate::resolved_fn!(bfree: extern "C" fn(*mut c_void));
 // the format string itself.
 crate::resolved_fn!(blog: extern "C" fn(c_int, *const c_char, ...));
 
-fn log_line(msg: &str) {
+pub(crate) fn log_line(msg: &str) {
     let Some(blog) = blog() else {
         return;
     };

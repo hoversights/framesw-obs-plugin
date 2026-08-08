@@ -105,16 +105,28 @@ unsafe impl Sync for NdiLib {}
 
 static NDI: OnceLock<Option<NdiLib>> = OnceLock::new();
 
-/// NDI's own documented redistributable-discovery convention
-/// (`Processing.NDI.Lib.h`: `NDILIB_REDIST_FOLDER "NDI_RUNTIME_DIR_V6"`)
-/// — checked first; the hardcoded fallbacks below are the well-known
-/// default install locations for when that variable isn't set. The
-/// macOS fallback (`/usr/local/lib/libndi.dylib`) is confirmed against a
-/// real local install (the NDI Runtime installer creates exactly this
-/// symlink); the Windows fallback matches the NDI Runtime installer's
-/// documented default but is unverified against a real Windows machine —
-/// same honesty standard as the rest of this crate's Windows story (see
-/// `WINDOWS_HANDOFF.md`).
+/// Every place the NDI runtime might live, most specific first.
+///
+/// **FrameSW's own bundled copy is checked before any system install**,
+/// and that entry is the one that makes Preview monitoring work at all
+/// for a normal user. The rest are for machines that happen to have NDI
+/// installed independently.
+///
+/// The history worth knowing: FrameSW bundles the NDI runtime next to its
+/// own executable (Windows resolves an exe's static imports before any of
+/// its code runs, so nothing else is reliable there) — but *this* code
+/// runs inside OBS, whose DLL/dylib search path never includes FrameSW's
+/// directory. So the bundled runtime existed and was simply unreachable,
+/// and every user without a separate NDI Runtime install got working VU
+/// meters (a different transport) and silent Preview monitoring. Found on
+/// a tester's Windows machine 2026-08-07 via a wall of
+/// `set_mix_sources ... NDI runtime not loaded/initialized` in the OBS log;
+/// macOS had the identical gap.
+///
+/// `NDI_RUNTIME_DIR_V6` is NDI's own documented discovery convention
+/// (`Processing.NDI.Lib.h`: `NDILIB_REDIST_FOLDER`). The bare filename
+/// last is a deliberate catch-all for anyone who has put the runtime on
+/// the loader's default search path themselves.
 fn candidate_paths() -> Vec<String> {
     let mut paths = Vec::new();
     if let Ok(dir) = std::env::var("NDI_RUNTIME_DIR_V6") {
@@ -125,13 +137,40 @@ fn candidate_paths() -> Vec<String> {
     }
     #[cfg(target_os = "macos")]
     {
+        // FrameSW.app's bundled copy. No registry on macOS, so probe the
+        // standard install locations: /Applications for a normal install,
+        // ~/Applications for a per-user one.
+        paths.push(
+            "/Applications/FrameSW.app/Contents/Frameworks/libndi.dylib".to_string(),
+        );
+        if let Ok(home) = std::env::var("HOME") {
+            paths.push(format!(
+                "{home}/Applications/FrameSW.app/Contents/Frameworks/libndi.dylib"
+            ));
+        }
+        // The NDI Runtime installer creates this symlink (confirmed against
+        // a real local install), and the SDK ships its own copy.
         paths.push("/usr/local/lib/libndi.dylib".to_string());
+        paths.push("/Library/NDI SDK for Apple/lib/macOS/libndi.dylib".to_string());
         paths.push("libndi.dylib".to_string());
     }
     #[cfg(target_os = "windows")]
     {
+        // FrameSW's bundled copy, via the install directory its NSIS
+        // installer records. Honours a non-default install location,
+        // unlike a hardcoded Program Files path.
+        if let Some(dir) = crate::platform::framesw_install_dir() {
+            paths.push(format!("{dir}\\Processing.NDI.Lib.x64.dll"));
+        }
+        // The NDI Runtime installer's documented default...
         paths.push(
             "C:\\Program Files\\NDI\\NDI 6 Runtime\\v6\\Processing.NDI.Lib.x64.dll".to_string(),
+        );
+        // ...and where NDI Tools puts it, which is what is actually present
+        // on machines that installed the Tools bundle rather than the bare
+        // runtime (this is the layout on our own build machine).
+        paths.push(
+            "C:\\Program Files\\NDI\\NDI 6 Tools\\Runtime\\Processing.NDI.Lib.x64.dll".to_string(),
         );
         paths.push("Processing.NDI.Lib.x64.dll".to_string());
     }
@@ -140,13 +179,24 @@ fn candidate_paths() -> Vec<String> {
 
 fn load_ndi() -> Option<NdiLib> {
     let mut handle = std::ptr::null_mut();
-    for path in candidate_paths() {
-        handle = crate::platform::load_library(&path);
+    let candidates = candidate_paths();
+    for path in &candidates {
+        handle = crate::platform::load_library(path);
         if !handle.is_null() {
+            crate::log_line(&format!("NDI runtime loaded from {path}"));
             break;
         }
     }
     if handle.is_null() {
+        // Say so once, with the paths tried. Previously this failed
+        // silently and the only symptom was a per-call `set_mix_sources`
+        // error naming the sender, which reads as "the mix bus is broken"
+        // rather than "there is no NDI runtime on this machine" - it cost
+        // a full log-forensics round trip to tell those apart.
+        crate::log_line(&format!(
+            "NDI runtime not found - Preview monitor audio will be silent (VU meters are unaffected). Tried: {}",
+            candidates.join("; ")
+        ));
         return None;
     }
     unsafe {

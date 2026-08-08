@@ -38,5 +38,7 @@ features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
     "Win32_System_ProcessStatus",
+    # Reading FrameSW's InstallLocation to find the NDI runtime it bundles.
+    "Win32_System_Registry",
     "Win32_System_Threading",
 ]

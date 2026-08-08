@@ -112,6 +112,95 @@ mod imp {
         unsafe { LoadLibraryW(wide.as_ptr()) as *mut c_void }
     }
 
+    /// Reads FrameSW's install directory from the key its NSIS installer
+    /// writes (`InstallLocation` under the standard Uninstall key). This is
+    /// how the plugin finds the NDI runtime FrameSW bundles: FrameSW ships
+    /// `Processing.NDI.Lib.x64.dll` next to its own exe because Windows
+    /// resolves an exe's static imports before any of its code runs, but
+    /// this plugin lives inside `obs64.exe`, whose DLL search path never
+    /// includes FrameSW's directory. Without this lookup the bundled copy is
+    /// unreachable and Preview monitoring is silent on every machine that
+    /// hasn't separately installed the NDI Runtime.
+    ///
+    /// Returns `None` rather than guessing a path if the key is absent —
+    /// a machine with no FrameSW install has nothing useful to point at.
+    pub fn framesw_install_dir() -> Option<String> {
+        // Must match `WriteRegStr HKLM "${UNINST_KEY}" "InstallLocation"` in
+        // the app repo's packaging/windows/installer.nsi.
+        const SUBKEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\FrameSW";
+        let raw = read_hklm_sz(SUBKEY, "InstallLocation")?;
+        let trimmed = raw.trim_end_matches('\\');
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
+    /// Reads one `REG_SZ` value from under `HKEY_LOCAL_MACHINE`. Split out
+    /// from `framesw_install_dir` so the fiddly part - sizing the buffer,
+    /// decoding UTF-16, handling a value that is not NUL-terminated on disk
+    /// - can be tested against a key that exists on every Windows machine,
+    /// rather than only on one that happens to have FrameSW installed.
+    pub fn read_hklm_sz(subkey: &str, value: &str) -> Option<String> {
+        use windows_sys::Win32::System::Registry::{
+            RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+            REG_SZ,
+        };
+
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        unsafe {
+            let mut key: HKEY = std::ptr::null_mut();
+            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, wide(subkey).as_ptr(), 0, KEY_READ, &mut key) != 0
+            {
+                return None;
+            }
+            // Ask for the size first: the value is written by the installer
+            // and there is no fixed upper bound worth assuming.
+            let name = wide(value);
+            let mut kind: u32 = 0;
+            let mut bytes: u32 = 0;
+            let sized = RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut bytes,
+            );
+            if sized != 0 || kind != REG_SZ || bytes == 0 {
+                RegCloseKey(key);
+                return None;
+            }
+            let mut buf: Vec<u16> = vec![0; (bytes as usize).div_ceil(2)];
+            let read = RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                buf.as_mut_ptr().cast(),
+                &mut bytes,
+            );
+            RegCloseKey(key);
+            if read != 0 {
+                return None;
+            }
+            // REG_SZ is not required to be null-terminated on disk; trim at
+            // the first NUL if one is present, otherwise take the whole run.
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            let s = String::from_utf16_lossy(&buf[..end]);
+            let s = s.trim_end_matches('\\');
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+    }
+
     /// `GetProcAddress` against a specific module handle (from
     /// `load_library`), not the process-wide enumeration `resolve` does.
     pub fn resolve_in(handle: *mut c_void, name: &str) -> *mut c_void {
@@ -198,6 +287,15 @@ pub unsafe fn resolve_as<F: Copy>(name: &str) -> Option<F> {
 /// isn't a loadable library on this platform.
 pub fn load_library(path: &str) -> *mut c_void {
     imp::load_library(path)
+}
+
+/// FrameSW's install directory, if this machine has one — the directory
+/// holding the NDI runtime FrameSW bundles. Windows reads it from the
+/// installer's registry key; macOS has no equivalent registry, so
+/// `ndi_ffi.rs` probes the standard `.app` locations directly instead.
+#[cfg(target_os = "windows")]
+pub fn framesw_install_dir() -> Option<String> {
+    imp::framesw_install_dir()
 }
 
 /// Resolves `name` against a specific library handle (from
