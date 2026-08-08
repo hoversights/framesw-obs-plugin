@@ -529,6 +529,29 @@ fn attach_callback_enum_proc_impl(_param: *mut c_void, source: *mut ObsSourceT) 
 static ATTACHED_PROGRAM_SCENE: Mutex<Option<String>> = Mutex::new(None);
 static ATTACHED_PREVIEW_SCENE: Mutex<Option<String>> = Mutex::new(None);
 
+/// Last Program/Preview scene names read on the UI thread, as
+/// `(program, preview)`. `None` until the first refresh lands.
+///
+/// **This cache exists to break a shutdown deadlock, not for speed.**
+/// `obs_module_unload` runs on OBS's UI thread — measured, not assumed:
+/// instrumenting both paths showed unload and the UI tasks on the same
+/// `ThreadId` — and it joins the rescan thread. If the rescan thread were
+/// blocked in `obs_queue_task(OBS_TASK_UI, .., wait: true)`, it would be
+/// waiting for a queue only the UI thread can drain, while the UI thread
+/// waits in `join()`. OBS hangs on exit, roughly once in a hundred quits:
+/// the worst kind of hang.
+///
+/// The `SHUTTING_DOWN` check before the call cannot fix that — the check
+/// and the blocking wait are not atomic, so a thread already past the check
+/// enters the wait regardless.
+///
+/// So the rescan thread never waits. It queues a refresh that writes here
+/// whenever the UI thread gets to it, and attaches using whatever the last
+/// refresh produced. One cycle of staleness (~5s) is harmless: taps are
+/// re-attached every cycle anyway, and this loop was already eventual by
+/// design.
+static CACHED_SCENE_ROLES: Mutex<Option<(Option<String>, Option<String>)>> = Mutex::new(None);
+
 /// Attaches the composited-mix audio callback to whichever scenes OBS
 /// currently reports as **Program and Preview**, by role.
 ///
@@ -551,22 +574,45 @@ static ATTACHED_PREVIEW_SCENE: Mutex<Option<String>> = Mutex::new(None);
 ///
 /// `obs_enum_sources` cannot reach scenes at all (confirmed: it filters to
 /// `OBS_SOURCE_TYPE_INPUT`), which is why they need this separate path.
-fn attach_scene_audio_taps() {
-    let Some(obs_queue_task) = obs_queue_task() else {
-        return;
-    };
-    let mut scenes = CurrentScenes::default();
-    obs_queue_task(
-        OBS_TASK_UI,
-        read_current_scenes_on_ui_thread,
-        (&mut scenes as *mut CurrentScenes).cast(),
-        true,
+/// Refreshes `CACHED_SCENE_ROLES`. Queued onto the UI thread **without
+/// waiting**, so it takes no pointer to caller stack — it writes into a
+/// `'static` and the caller may have moved on by the time this runs.
+extern "C" fn cache_scene_roles_on_ui_thread(_param: *mut c_void) {
+    ffi_guard(
+        "cache_scene_roles_on_ui_thread",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            let program = frontend_scene_name(obs_frontend_get_current_scene());
+            let preview = frontend_scene_name(obs_frontend_get_current_preview_scene());
+            if let Ok(mut cached) = CACHED_SCENE_ROLES.lock() {
+                *cached = Some((program, preview));
+            }
+        }),
     );
-    if !scenes.ran {
-        return; // UI task handler unavailable — try again next cycle
+}
+
+fn attach_scene_audio_taps() {
+    // Ask the UI thread for fresh names, but never wait for the answer —
+    // see `CACHED_SCENE_ROLES`. This call is what unload's `join()` would
+    // otherwise deadlock against.
+    if let Some(obs_queue_task) = obs_queue_task() {
+        obs_queue_task(
+            OBS_TASK_UI,
+            cache_scene_roles_on_ui_thread,
+            std::ptr::null_mut(),
+            false,
+        );
     }
-    attach_role_tap("program", scenes.program.as_deref(), &ATTACHED_PROGRAM_SCENE);
-    attach_role_tap("preview", scenes.preview.as_deref(), &ATTACHED_PREVIEW_SCENE);
+
+    let snapshot = match CACHED_SCENE_ROLES.lock() {
+        Ok(cached) => cached.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let Some((program, preview)) = snapshot else {
+        return; // first cycle — nothing read yet, attach on the next one
+    };
+    attach_role_tap("program", program.as_deref(), &ATTACHED_PROGRAM_SCENE);
+    attach_role_tap("preview", preview.as_deref(), &ATTACHED_PREVIEW_SCENE);
 }
 
 /// Moves one role's audio tap to `scene`, detaching from whatever that role
