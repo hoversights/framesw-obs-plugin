@@ -6,6 +6,14 @@ version = 4
 name = "framesw-obs-plugin"
 version = "0.2.0"
 dependencies = [
+ "studio-mode-meters-core",
+ "windows-sys",
+]
+
+[[package]]
+name = "studio-mode-meters-core"
+version = "0.2.0"
+dependencies = [
  "windows-sys",
 ]
 

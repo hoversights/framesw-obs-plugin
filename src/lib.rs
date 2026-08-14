@@ -53,10 +53,14 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::Mutex;
 
 mod audio_tap;
-mod calldata;
 mod ndi_ffi;
-mod obs_data;
-mod platform;
+
+// `calldata`, `obs_data` and `platform` now live in the shared core crate
+// so the community metering plugin builds on the same copy of this
+// FFI-critical code rather than a fork of it. Re-exported under their old
+// names so the ~1900 lines below need no edit — a refactor that has to be
+// invisible to FrameSW is not the place to also churn call sites.
+use studio_mode_meters_core::{calldata, obs_data, platform};
 
 use obs_data::SourceLevel;
 
@@ -105,8 +109,8 @@ const LOG_INFO: c_int = 300;
 // Resolved at runtime (`platform::resolve_as` via `resolved_fn!`), not
 // linked at build time — see `platform.rs`'s module doc for why. Exact
 // signatures confirmed against obs-studio@master's `libobs/obs.h`.
-crate::resolved_fn!(obs_enum_sources: extern "C" fn(ObsEnumSourcesProc, *mut c_void));
-crate::resolved_fn!(obs_source_add_audio_capture_callback: extern "C" fn(*mut ObsSourceT, ObsSourceAudioCaptureT, *mut c_void));
+studio_mode_meters_core::resolved_fn!(obs_enum_sources: extern "C" fn(ObsEnumSourcesProc, *mut c_void));
+studio_mode_meters_core::resolved_fn!(obs_source_add_audio_capture_callback: extern "C" fn(*mut ObsSourceT, ObsSourceAudioCaptureT, *mut c_void));
 // Removing before every add keeps the callback list at exactly one entry
 // per source: libobs's add is a bare `da_push_back` with NO dedup
 // (obs-source.c, confirmed 2026-07-19), so the 5s re-attach loops would
@@ -115,15 +119,15 @@ crate::resolved_fn!(obs_source_add_audio_capture_callback: extern "C" fn(*mut Ob
 // remove-then-add idempotent without tracking attach state ourselves
 // (any name/pointer-based "already attached" set would go stale when
 // FrameSW destroys and recreates a same-named input).
-crate::resolved_fn!(obs_source_remove_audio_capture_callback: extern "C" fn(*mut ObsSourceT, ObsSourceAudioCaptureT, *mut c_void));
-crate::resolved_fn!(obs_source_active: extern "C" fn(*const ObsSourceT) -> bool);
+studio_mode_meters_core::resolved_fn!(obs_source_remove_audio_capture_callback: extern "C" fn(*mut ObsSourceT, ObsSourceAudioCaptureT, *mut c_void));
+studio_mode_meters_core::resolved_fn!(obs_source_active: extern "C" fn(*const ObsSourceT) -> bool);
 // Capture callbacks receive PRE-fader audio by design in libobs (volume
 // is applied later, at mix time). OBS's own mixer meter gets these same
 // raw samples and multiplies by the source's current volume itself
 // (obs-audio-controls.c, volmeter_source_data_received) — any meter that
 // should track the slider must do the same, hence this lookup.
-crate::resolved_fn!(obs_source_get_volume: extern "C" fn(*const ObsSourceT) -> f32);
-crate::resolved_fn!(obs_source_get_name: extern "C" fn(*const ObsSourceT) -> *const c_char);
+studio_mode_meters_core::resolved_fn!(obs_source_get_volume: extern "C" fn(*const ObsSourceT) -> f32);
+studio_mode_meters_core::resolved_fn!(obs_source_get_name: extern "C" fn(*const ObsSourceT) -> *const c_char);
 // `libobs/obs.h`'s `struct obs_audio_info { uint32_t samples_per_sec; enum
 // speaker_layout speakers; };` and `EXPORT bool obs_get_audio_info(struct
 // obs_audio_info *oai);` — the one global source of "how many channels/
@@ -136,7 +140,7 @@ struct ObsAudioInfo {
     samples_per_sec: u32,
     speakers: u32,
 }
-crate::resolved_fn!(obs_get_audio_info: extern "C" fn(*mut ObsAudioInfo) -> bool);
+studio_mode_meters_core::resolved_fn!(obs_get_audio_info: extern "C" fn(*mut ObsAudioInfo) -> bool);
 
 /// `libobs/media-io/audio-io.h`'s `get_audio_channels` — a `static
 /// inline` C function, so it has no linkable symbol to resolve; this is
@@ -163,8 +167,8 @@ fn speaker_layout_to_channels(speakers: u32) -> u32 {
 // deliberately excludes scenes (`OBS_SOURCE_TYPE_SCENE`) entirely — the
 // only way to reach FrameSW's fixed-name Program/Preview scenes
 // ("PGM-A"/"PGM-B") is a direct name lookup, not the general rescan.
-crate::resolved_fn!(obs_get_source_by_name: extern "C" fn(*const c_char) -> *mut ObsSourceT);
-crate::resolved_fn!(obs_source_release: extern "C" fn(*mut ObsSourceT));
+studio_mode_meters_core::resolved_fn!(obs_get_source_by_name: extern "C" fn(*const c_char) -> *mut ObsSourceT);
+studio_mode_meters_core::resolved_fn!(obs_source_release: extern "C" fn(*mut ObsSourceT));
 // CORRECTION (2026-07-31, second pass): an earlier comment here claimed
 // obs-websocket's `CreateScene` request was itself crashing OBS 32.1.2,
 // and blamed OBS 32.1's "partial"/"unstable" Canvas support. Both claims
@@ -178,8 +182,8 @@ crate::resolved_fn!(obs_source_release: extern "C" fn(*mut ObsSourceT));
 // `create_scene` (below) is kept anyway on its own merits: creating
 // scenes from inside OBS's own process is one fewer obs-websocket round
 // trip, and it degrades gracefully when this plugin isn't installed.
-crate::resolved_fn!(obs_scene_create: extern "C" fn(*const c_char) -> *mut ObsSceneT);
-crate::resolved_fn!(obs_scene_release: extern "C" fn(*mut ObsSceneT));
+studio_mode_meters_core::resolved_fn!(obs_scene_create: extern "C" fn(*const c_char) -> *mut ObsSceneT);
+studio_mode_meters_core::resolved_fn!(obs_scene_release: extern "C" fn(*mut ObsSceneT));
 
 // libobs/obs.h: `void obs_queue_task(enum obs_task_type type, obs_task_t
 // task, void *param, bool wait)`, where `obs_task_t` is
@@ -189,7 +193,7 @@ crate::resolved_fn!(obs_scene_release: extern "C" fn(*mut ObsSceneT));
 // returns — the sanctioned way for a plugin on a background thread to
 // touch frontend state. obs-websocket itself uses exactly this for
 // `SetStudioModeEnabled`; it just fails to for the getters below.
-crate::resolved_fn!(obs_queue_task: extern "C" fn(c_int, extern "C" fn(*mut c_void), *mut c_void, bool));
+studio_mode_meters_core::resolved_fn!(obs_queue_task: extern "C" fn(c_int, extern "C" fn(*mut c_void), *mut c_void, bool));
 // frontend/api/obs-frontend-api.h. Both getters return a *new strong
 // reference*, and both are genuinely nullable: `obs_frontend_get_current_
 // scene` resolves `main->programScene` (a weak ref that goes dead when the
@@ -198,9 +202,9 @@ crate::resolved_fn!(obs_queue_task: extern "C" fn(c_int, extern "C" fn(*mut c_vo
 // whenever Studio Mode is off. Resolved process-wide rather than against
 // libobs specifically — these live in `obs-frontend-api`, which
 // `platform::resolve` already searches on both platforms.
-crate::resolved_fn!(obs_frontend_get_current_scene: extern "C" fn() -> *mut ObsSourceT);
-crate::resolved_fn!(obs_frontend_get_current_preview_scene: extern "C" fn() -> *mut ObsSourceT);
-crate::resolved_fn!(obs_frontend_preview_program_mode_active: extern "C" fn() -> bool);
+studio_mode_meters_core::resolved_fn!(obs_frontend_get_current_scene: extern "C" fn() -> *mut ObsSourceT);
+studio_mode_meters_core::resolved_fn!(obs_frontend_get_current_preview_scene: extern "C" fn() -> *mut ObsSourceT);
+studio_mode_meters_core::resolved_fn!(obs_frontend_preview_program_mode_active: extern "C" fn() -> bool);
 
 /// `enum obs_task_type`'s first variant in libobs/obs.h — run on OBS's
 /// Qt UI thread.
@@ -211,11 +215,11 @@ const OBS_TASK_UI: c_int = 0;
 // whole enumeration, so an `obs_output_t*` handed to the callback stays
 // alive for that call — but only the output struct itself. See
 // `list_video_outputs` for what that does and doesn't make safe to read.
-crate::resolved_fn!(obs_enum_outputs: extern "C" fn(extern "C" fn(*mut c_void, *mut ObsOutputT) -> bool, *mut c_void));
-crate::resolved_fn!(obs_output_get_name: extern "C" fn(*const ObsOutputT) -> *const c_char);
-crate::resolved_fn!(obs_output_get_id: extern "C" fn(*const ObsOutputT) -> *const c_char);
-crate::resolved_fn!(obs_output_active: extern "C" fn(*const ObsOutputT) -> bool);
-crate::resolved_fn!(obs_output_get_flags: extern "C" fn(*const ObsOutputT) -> u32);
+studio_mode_meters_core::resolved_fn!(obs_enum_outputs: extern "C" fn(extern "C" fn(*mut c_void, *mut ObsOutputT) -> bool, *mut c_void));
+studio_mode_meters_core::resolved_fn!(obs_output_get_name: extern "C" fn(*const ObsOutputT) -> *const c_char);
+studio_mode_meters_core::resolved_fn!(obs_output_get_id: extern "C" fn(*const ObsOutputT) -> *const c_char);
+studio_mode_meters_core::resolved_fn!(obs_output_active: extern "C" fn(*const ObsOutputT) -> bool);
+studio_mode_meters_core::resolved_fn!(obs_output_get_flags: extern "C" fn(*const ObsOutputT) -> u32);
 
 /// `libobs/obs-output.h`: `#define OBS_OUTPUT_VIDEO (1 << 0)`.
 const OBS_OUTPUT_VIDEO: u32 = 1 << 0;
@@ -227,11 +231,11 @@ const OBS_OUTPUT_VIDEO: u32 = 1 << 0;
 // file on close, so any external edit made while OBS runs is silently
 // clobbered. `obs_frontend_get_global_config` is the deprecated alias for
 // the same thing and is deliberately not used here.
-crate::resolved_fn!(obs_frontend_get_user_config: extern "C" fn() -> *mut ConfigT);
+studio_mode_meters_core::resolved_fn!(obs_frontend_get_user_config: extern "C" fn() -> *mut ConfigT);
 // `libobs/util/config-file.h`.
-crate::resolved_fn!(config_get_bool: extern "C" fn(*mut ConfigT, *const c_char, *const c_char) -> bool);
-crate::resolved_fn!(config_set_bool: extern "C" fn(*mut ConfigT, *const c_char, *const c_char, bool));
-crate::resolved_fn!(config_save_safe: extern "C" fn(*mut ConfigT, *const c_char, *const c_char) -> c_int);
+studio_mode_meters_core::resolved_fn!(config_get_bool: extern "C" fn(*mut ConfigT, *const c_char, *const c_char) -> bool);
+studio_mode_meters_core::resolved_fn!(config_set_bool: extern "C" fn(*mut ConfigT, *const c_char, *const c_char, bool));
+studio_mode_meters_core::resolved_fn!(config_save_safe: extern "C" fn(*mut ConfigT, *const c_char, *const c_char) -> c_int);
 
 /// user.ini's `[BasicWindow] ProjectorAlwaysOnTop` — OBS Settings ->
 /// General -> Projectors -> "Make projectors always on top". Verified
@@ -280,17 +284,17 @@ const NDI_PREVIEW_OUTPUT_KEY: &str = "PreviewOutputEnabled";
 //   makes it complete before returning instead of landing whenever.
 // * `obs_frontend_get_current_profile` returns `bstrdup(...)` — caller
 //   frees with `bfree`.
-crate::resolved_fn!(obs_frontend_get_current_profile: extern "C" fn() -> *mut c_char);
-crate::resolved_fn!(obs_frontend_set_current_profile: extern "C" fn(*const c_char));
-crate::resolved_fn!(obs_frontend_duplicate_profile: extern "C" fn(*const c_char));
+studio_mode_meters_core::resolved_fn!(obs_frontend_get_current_profile: extern "C" fn() -> *mut c_char);
+studio_mode_meters_core::resolved_fn!(obs_frontend_set_current_profile: extern "C" fn(*const c_char));
+studio_mode_meters_core::resolved_fn!(obs_frontend_duplicate_profile: extern "C" fn(*const c_char));
 // `libobs/util/bmem.h` — frees what libobs allocated.
-crate::resolved_fn!(bfree: extern "C" fn(*mut c_void));
+studio_mode_meters_core::resolved_fn!(bfree: extern "C" fn(*mut c_void));
 // libobs/util/base.h — real signature is variadic
 // (`void blog(int log_level, const char *format, ...)`). Always called
 // here with a fixed "%s" format and exactly one string arg (`log_line`
 // below) — deliberately never passing anything OBS-/source-controlled as
 // the format string itself.
-crate::resolved_fn!(blog: extern "C" fn(c_int, *const c_char, ...));
+studio_mode_meters_core::resolved_fn!(blog: extern "C" fn(c_int, *const c_char, ...));
 
 pub(crate) fn log_line(msg: &str) {
     let Some(blog) = blog() else {

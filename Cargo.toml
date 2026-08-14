@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/core"]
+
 [package]
 name = "framesw-obs-plugin"
 version = "0.2.0"
@@ -31,6 +34,7 @@ crate-type = ["cdylib"]
 # "verify against real source, don't hand-port ABI-critical code" rule
 # this crate follows for libobs itself.
 [dependencies]
+studio-mode-meters-core = { path = "crates/core" }
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 version = "0.59"

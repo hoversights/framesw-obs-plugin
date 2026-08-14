@@ -1,0 +1,26 @@
+[package]
+name = "studio-mode-meters-core"
+version = "0.2.0"
+edition = "2021"
+publish = false
+# Same licence as the plugin that loads it into OBS, and as OBS itself.
+license = "GPL-2.0-or-later"
+description = "Shared OBS plugin plumbing: FFI guards, calldata, obs_data, and platform symbol resolution."
+
+[lib]
+name = "studio_mode_meters_core"
+
+# Kept identical to the consuming cdylib's dependency set. `platform.rs`
+# needs real Win32 bindings for its symbol-resolution fallback (Windows has
+# no RTLD_DEFAULT equivalent).
+[dependencies]
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+]
