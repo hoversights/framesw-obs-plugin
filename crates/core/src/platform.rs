@@ -324,8 +324,12 @@ pub unsafe fn resolve_in_as<F: Copy>(handle: *mut c_void, name: &str) -> Option<
 #[macro_export]
 macro_rules! resolved_fn {
     ($name:ident : $ty:ty) => {
+        // `pub` because these resolvers now live in the core crate while
+        // some call sites are in the consuming cdylib. Visibility is not a
+        // safety boundary here: every resolver returns `Option` and each
+        // call site must handle `None` regardless of who calls it.
         #[allow(non_snake_case)]
-        fn $name() -> Option<$ty> {
+        pub fn $name() -> Option<$ty> {
             static CELL: std::sync::OnceLock<Option<$ty>> = std::sync::OnceLock::new();
             *CELL.get_or_init(|| unsafe { $crate::platform::resolve_as(stringify!($name)) })
         }

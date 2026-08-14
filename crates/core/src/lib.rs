@@ -13,6 +13,7 @@
 
 pub mod calldata;
 pub mod obs_data;
+pub mod metering;
 pub mod platform;
 
 use std::ffi::{c_char, c_int, CString};
