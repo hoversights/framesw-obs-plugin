@@ -60,7 +60,7 @@ pub struct SourceLevel {
     pub active: bool,
 }
 
-/// Builds `{"levels": [{"name": ..., "peak_db": ..., "on_program": ..., "active": ...}, ...]}`
+/// Builds `{"levels": [{"name": ..., "peak_db": ..., "on_program": ...}, ...]}`
 /// as a real `obs_data_t*`, ready to hand to
 /// `calldata::vendor_emit_event`. Caller owns the returned pointer and
 /// must release it via `release` once the emit call returns (per
@@ -106,24 +106,19 @@ pub fn build_levels_payload(levels: &[SourceLevel]) -> *mut ObsDataT {
         obs_data_set_string(entry, name_key.as_ptr(), name_val.as_ptr());
         let peak_key = cstr("peak_db");
         obs_data_set_double(entry, peak_key.as_ptr(), level.peak_db as f64);
-        // Emitted under BOTH names during the rename.
+        // `on_program`, and only that. The old name was `active`, which
+        // invited comparison with obs-websocket's own `GetSourceActive` —
+        // a different question, with a genuinely different answer (a
+        // source added straight into the live Program scene reads false
+        // there until the next transition).
         //
-        // `on_program` is the real name: it says what the flag means, and
-        // does not invite comparison with obs-websocket's own
-        // `GetSourceActive`, which answers a different question and can
-        // disagree (measured 2026-08-14 — a source added straight into the
-        // live Program scene reads false there until the next transition).
-        //
-        // `active` stays for now because a consumer parsing it with `?` on
-        // a missing key loses the WHOLE payload, not one field — so a user
-        // running an older app against this plugin would silently lose
-        // Preview metering entirely. Two keys costs a few bytes per event
-        // and removes that cliff. Drop `active` once no shipped FrameSW
-        // reads it.
+        // The transitional dual-key emit is gone: no released FrameSW
+        // pairs a new plugin with an old app, because the app reinstalls
+        // its own bundled plugin at launch. FrameSW's parser still accepts
+        // either name, which is the asymmetry that matters — old plugins
+        // do exist in the wild, and tolerance there costs nothing.
         let on_program_key = cstr("on_program");
         obs_data_set_bool(entry, on_program_key.as_ptr(), level.active);
-        let active_key = cstr("active");
-        obs_data_set_bool(entry, active_key.as_ptr(), level.active);
         // `obs_data_array_push_back` addrefs its own copy internally
         // (standard OBS refcounting convention for every "add/set" call
         // in this API) — release our local ref immediately afterward
