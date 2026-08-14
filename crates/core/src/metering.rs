@@ -764,3 +764,24 @@ pub fn frontend_scene_name(getter: Option<extern "C" fn() -> *mut ObsSourceT>) -
     obs_source_release(source);
     name
 }
+
+/// Stops the background threads and waits for them to actually exit.
+///
+/// Not "asks them to stop" — waits. OBS unloads a module without telling
+/// its detached threads, and they keep calling into libobs afterwards:
+/// confirmed live 2026-07-15 as a segfault inside `obs_enum_sources`'s
+/// internal mutex at the moment OBS closed. Blocks briefly, at most one
+/// loop iteration (~100ms).
+///
+/// A consumer's `obs_module_unload` must call this before doing anything
+/// else, and must do its own teardown *after* it returns.
+pub fn shutdown() {
+    SHUTTING_DOWN.store(true, Ordering::Release);
+    let handles: Vec<std::thread::JoinHandle<()>> = match THREADS.lock() {
+        Ok(mut threads) => threads.drain(..).collect(),
+        Err(_) => Vec::new(),
+    };
+    for handle in handles {
+        let _ = handle.join();
+    }
+}

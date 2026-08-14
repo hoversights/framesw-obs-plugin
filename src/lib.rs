@@ -1211,14 +1211,7 @@ pub extern "C" fn obs_module_post_load() {
 #[no_mangle]
 pub extern "C" fn obs_module_unload() {
     ffi_guard("obs_module_unload", (), || {
-        SHUTTING_DOWN.store(true, Ordering::Release);
-        let handles: Vec<std::thread::JoinHandle<()>> = match THREADS.lock() {
-            Ok(mut threads) => threads.drain(..).collect(),
-            Err(_) => Vec::new(),
-        };
-        for handle in handles {
-            let _ = handle.join();
-        }
+        studio_mode_meters_core::metering::shutdown();
         // No active monitor tap's NDI sender should outlive the plugin.
         audio_tap::stop_all();
         log_line("unloaded — background threads stopped cleanly");
