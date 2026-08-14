@@ -93,7 +93,6 @@ crate::resolved_fn!(obs_source_add_audio_capture_callback: extern "C" fn(*mut Ob
 // (any name/pointer-based "already attached" set would go stale when
 // FrameSW destroys and recreates a same-named input).
 crate::resolved_fn!(obs_source_remove_audio_capture_callback: extern "C" fn(*mut ObsSourceT, ObsSourceAudioCaptureT, *mut c_void));
-crate::resolved_fn!(obs_source_active: extern "C" fn(*const ObsSourceT) -> bool);
 // Capture callbacks receive PRE-fader audio by design in libobs (volume
 // is applied later, at mix time). OBS's own mixer meter gets these same
 // raw samples and multiplies by the source's current volume itself
@@ -175,6 +174,12 @@ crate::resolved_fn!(obs_queue_task: extern "C" fn(c_int, extern "C" fn(*mut c_vo
 // whenever Studio Mode is off. Resolved process-wide rather than against
 // libobs specifically — these live in `obs-frontend-api`, which
 // `platform::resolve` already searches on both platforms.
+/// `libobs/obs.h`: `void obs_source_enum_active_sources(obs_source_t *source,
+/// obs_source_enum_proc_t enum_callback, void *param);` — for a scene, the
+/// items it is currently rendering.
+type ObsSourceEnumProc = extern "C" fn(parent: *mut ObsSourceT, child: *mut ObsSourceT, param: *mut c_void);
+crate::resolved_fn!(obs_source_enum_active_sources: extern "C" fn(*mut ObsSourceT, ObsSourceEnumProc, *mut c_void));
+
 crate::resolved_fn!(obs_frontend_get_current_scene: extern "C" fn() -> *mut ObsSourceT);
 crate::resolved_fn!(obs_frontend_get_current_preview_scene: extern "C" fn() -> *mut ObsSourceT);
 crate::resolved_fn!(obs_frontend_preview_program_mode_active: extern "C" fn() -> bool);
@@ -395,9 +400,6 @@ pub fn audio_capture_callback_impl(
     let Some(obs_source_get_name) = obs_source_get_name() else {
         return;
     };
-    let Some(obs_source_active) = obs_source_active() else {
-        return;
-    };
     let name = unsafe {
         let ptr = obs_source_get_name(source);
         if ptr.is_null() {
@@ -405,7 +407,9 @@ pub fn audio_capture_callback_impl(
         }
         CStr::from_ptr(ptr).to_string_lossy().into_owned()
     };
-    let active = obs_source_active(source);
+    // Bus by scene membership, not `obs_source_active(source)` — see
+    // `SOURCE_BUS` for the measurement that retired that call.
+    let active = source_is_on_program(&name);
 
     // Preview-layer monitor taps (`audio_tap.rs`) — reuses this exact
     // callback (already attached to every source, unconditionally) rather
@@ -562,6 +566,83 @@ pub extern "C" fn cache_scene_roles_on_ui_thread(_param: *mut c_void) {
     );
 }
 
+/// Source name -> true when that source is on the Program bus.
+///
+/// Replaces `obs_source_active()`, which was measured on 2026-08-14
+/// returning false for sources demonstrably in the Program scene — even
+/// ones with video. Whatever that call tracks, it is not "is this source
+/// on the Program bus", and no other per-source query answers that
+/// question either: `obs_source_showing` is true for both buses, which is
+/// the distinction being asked about.
+///
+/// The authoritative answer is membership. The plugin already resolves
+/// which scene is Program and which is Preview (`attach_scene_audio_taps`),
+/// so walking each of those two scenes and recording what is inside it
+/// gives the bus by construction, with nothing left to disagree.
+///
+/// Rebuilt on every rescan, so a source that moves between scenes is
+/// re-classified within one cycle rather than keeping a stale bus forever.
+static SOURCE_BUS: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+
+/// Collects one scene's active children into `SOURCE_BUS`.
+extern "C" fn collect_bus_member(
+    _parent: *mut ObsSourceT,
+    child: *mut ObsSourceT,
+    param: *mut c_void,
+) {
+    let is_program = !param.is_null();
+    let Some(get_name) = obs_source_get_name() else {
+        return;
+    };
+    let raw = get_name(child);
+    if raw.is_null() {
+        return;
+    }
+    let name = unsafe { CStr::from_ptr(raw) }.to_string_lossy().to_string();
+    if let Ok(mut guard) = SOURCE_BUS.lock() {
+        let map = guard.get_or_insert_with(HashMap::new);
+        // Program wins if a source is somehow in both: what is on air is
+        // the more consequential fact to report.
+        let entry = map.entry(name).or_insert(is_program);
+        *entry = *entry || is_program;
+    }
+}
+
+/// Rebuilds `SOURCE_BUS` from the current Program and Preview scenes.
+pub fn refresh_source_bus(program: Option<&str>, preview: Option<&str>) {
+    let (Some(by_name), Some(release), Some(enum_active)) = (
+        obs_get_source_by_name(),
+        obs_source_release(),
+        obs_source_enum_active_sources(),
+    ) else {
+        return;
+    };
+    if let Ok(mut guard) = SOURCE_BUS.lock() {
+        *guard = Some(HashMap::new());
+    }
+    for (scene, is_program) in [(program, true), (preview, false)] {
+        let Some(scene) = scene else { continue };
+        let Ok(cname) = CString::new(scene) else { continue };
+        let src = by_name(cname.as_ptr());
+        if src.is_null() {
+            continue;
+        }
+        // A non-null param marks the Program walk; null marks Preview.
+        let marker = if is_program { 1usize as *mut c_void } else { std::ptr::null_mut() };
+        enum_active(src, collect_bus_member, marker);
+        release(src);
+    }
+}
+
+/// Which bus a source is on, or false when it is on neither/unknown.
+pub fn source_is_on_program(name: &str) -> bool {
+    SOURCE_BUS
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|m| m.get(name).copied()))
+        .unwrap_or(false)
+}
+
 pub fn attach_scene_audio_taps() {
     // Ask the UI thread for fresh names, but never wait for the answer —
     // see `CACHED_SCENE_ROLES`. This call is what unload's `join()` would
@@ -584,6 +665,9 @@ pub fn attach_scene_audio_taps() {
     };
     attach_role_tap("program", program.as_deref(), &ATTACHED_PROGRAM_SCENE);
     attach_role_tap("preview", preview.as_deref(), &ATTACHED_PREVIEW_SCENE);
+    // Rebuilt here, where the two roles have just been resolved, so the
+    // bus map and the taps can never describe different scenes.
+    refresh_source_bus(program.as_deref(), preview.as_deref());
 }
 
 /// Moves one role's audio tap to `scene`, detaching from whatever that role
