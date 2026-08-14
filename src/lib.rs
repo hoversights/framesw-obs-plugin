@@ -103,9 +103,6 @@ type ObsSourceAudioCaptureT =
 /// `libobs/obs.h`: `void obs_enum_sources(bool (*enum_proc)(void *, obs_source_t *), void *param);`
 type ObsEnumSourcesProc = extern "C" fn(param: *mut c_void, source: *mut ObsSourceT) -> bool;
 
-/// `libobs/util/base.h`.
-const LOG_INFO: c_int = 300;
-
 // Resolved at runtime (`platform::resolve_as` via `resolved_fn!`), not
 // linked at build time — see `platform.rs`'s module doc for why. Exact
 // signatures confirmed against obs-studio@master's `libobs/obs.h`.
@@ -294,18 +291,11 @@ studio_mode_meters_core::resolved_fn!(bfree: extern "C" fn(*mut c_void));
 // here with a fixed "%s" format and exactly one string arg (`log_line`
 // below) — deliberately never passing anything OBS-/source-controlled as
 // the format string itself.
-studio_mode_meters_core::resolved_fn!(blog: extern "C" fn(c_int, *const c_char, ...));
 
-pub(crate) fn log_line(msg: &str) {
-    let Some(blog) = blog() else {
-        return;
-    };
-    let Ok(fmt) = CString::new("[framesw] %s") else {
-        return;
-    };
-    let msg = CString::new(msg).unwrap_or_else(|_| CString::new("[unprintable log line]").unwrap());
-    blog(LOG_INFO, fmt.as_ptr(), msg.as_ptr());
-}
+// Provided by the core crate, which stamps whichever log prefix the
+// consumer registered via `set_identity`. Re-exported under the old name so
+// every call site below is untouched.
+pub(crate) use studio_mode_meters_core::log_line;
 
 // ---------------------------------------------------------------------
 // FFI panic safety: every function OBS calls into this plugin — either
@@ -1869,6 +1859,12 @@ pub extern "C" fn obs_module_description() -> *const c_char {
 #[no_mangle]
 pub extern "C" fn obs_module_load() -> bool {
     ffi_guard("obs_module_load", false, || {
+        // Before the first log line, so nothing is ever tagged with core's
+        // neutral fallback prefix instead of FrameSW's.
+        studio_mode_meters_core::set_identity(studio_mode_meters_core::Identity {
+            vendor: "framesw",
+            log_prefix: "[framesw]",
+        });
         log_line("loaded — watching for audio on Preview-only sources");
         spawn_periodic_rescan();
         true
@@ -1883,7 +1879,7 @@ pub extern "C" fn obs_module_load() -> bool {
 #[no_mangle]
 pub extern "C" fn obs_module_post_load() {
     ffi_guard("obs_module_post_load", (), || {
-        let vendor = calldata::register_vendor("framesw");
+        let vendor = calldata::register_vendor(studio_mode_meters_core::identity().vendor);
         if vendor.is_null() {
             log_line("obs-websocket not installed/loaded — audio levels will only reach OBS's own log, not FrameSW");
             return;

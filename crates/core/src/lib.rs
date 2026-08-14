@@ -14,3 +14,87 @@
 pub mod calldata;
 pub mod obs_data;
 pub mod platform;
+
+use std::ffi::{c_char, c_int, CString};
+use std::sync::OnceLock;
+
+/// Who is using this crate — supplied once, at module load.
+///
+/// Exists because everything user-visible in here used to be hardcoded to
+/// FrameSW. A community plugin writing `[framesw]` into a stranger's OBS
+/// log, or claiming the `framesw` obs-websocket vendor name, would be
+/// indefensible — and the vendor name in particular is a public API
+/// contract that clients match on.
+#[derive(Debug, Clone, Copy)]
+pub struct Identity {
+    /// obs-websocket vendor name. Clients call requests and match events
+    /// against this string, so it is permanent once published.
+    pub vendor: &'static str,
+    /// Bracketed tag on every log line, e.g. `[studio-mode-meters]`.
+    pub log_prefix: &'static str,
+}
+
+static IDENTITY: OnceLock<Identity> = OnceLock::new();
+
+/// Registers the consumer's identity. First call wins.
+///
+/// Deliberately infallible and silent on a second call: this runs inside
+/// `obs_module_load`, where returning an error or panicking would take OBS
+/// down with it. A duplicate call means a programming error in the
+/// consumer, not a condition a user can hit.
+pub fn set_identity(identity: Identity) {
+    let _ = IDENTITY.set(identity);
+}
+
+/// The registered identity, or a neutral fallback.
+///
+/// The fallback exists so a logging call that somehow beats `set_identity`
+/// still produces a line rather than vanishing — a missing log during
+/// module load is exactly when you need it most.
+pub fn identity() -> Identity {
+    *IDENTITY.get().unwrap_or(&Identity {
+        vendor: "obs-plugin",
+        log_prefix: "[obs-plugin]",
+    })
+}
+
+const LOG_INFO: c_int = 300;
+
+resolved_fn!(blog: extern "C" fn(c_int, *const c_char, ...));
+
+/// Writes one line to OBS's own log, tagged with the consumer's prefix.
+///
+/// Silently does nothing if `blog` cannot be resolved — a plugin that
+/// cannot log must still run, and there is nowhere to report the failure
+/// to anyway.
+pub fn log_line(msg: &str) {
+    let Some(blog) = blog() else {
+        return;
+    };
+    let Ok(fmt) = CString::new(format!("{} %s", identity().log_prefix)) else {
+        return;
+    };
+    let msg = CString::new(msg).unwrap_or_else(|_| CString::new("[unprintable log line]").unwrap());
+    blog(LOG_INFO, fmt.as_ptr(), msg.as_ptr());
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn falls_back_to_a_neutral_name_when_unset() {
+        // Whichever test runs first may set it; only the shape matters.
+        let id = identity();
+        assert!(!id.vendor.is_empty() && id.log_prefix.starts_with('['));
+    }
+
+    #[test]
+    fn the_fallback_is_not_framesw() {
+        // The whole point of this module: nothing in core may default to
+        // the consuming product's name.
+        let id = identity();
+        assert!(!id.vendor.contains("framesw"), "core must not default to FrameSW's vendor name");
+        assert!(!id.log_prefix.contains("framesw"), "core must not default to FrameSW's log prefix");
+    }
+}
