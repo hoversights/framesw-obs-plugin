@@ -828,6 +828,358 @@ fn handle_projector_on_top_impl(
     obs_data::set_bool(response_data, "enabled", state.value);
 }
 
+// ---------------------------------------------------------------------
+// Forcing a source to render (`set_source_showing`)
+// ---------------------------------------------------------------------
+
+/// The one source this plugin currently holds a showing reference on, by
+/// name, or `None`.
+///
+/// A single slot rather than a map on purpose. `obs_source_inc_showing`
+/// moves a reference count, so a caller that increments and then dies
+/// without decrementing leaves that source rendering — for a browser source,
+/// running a page — until OBS restarts. Capping the plugin at one forced
+/// source bounds that leak to exactly one no matter how badly FrameSW
+/// behaves: asking for a second releases the first.
+static FORCED_SHOWING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Carries a showing request across the UI-thread hop.
+struct SetShowing {
+    ran: bool,
+    name: String,
+    want: bool,
+    /// `None` on success, otherwise why it could not be done.
+    error: Option<String>,
+    /// Set when honouring this request released a *different* source, so
+    /// the response can say so rather than leaving it invisible.
+    released: Option<String>,
+}
+
+/// Increments/decrements the showing count, then updates `FORCED_SHOWING`
+/// only if the libobs call actually happened — so the slot never claims a
+/// reference the plugin does not hold.
+///
+/// On OBS's UI thread for the same reason as every other handler here: this
+/// runs a source's `show`/`hide` callback, and obs-browser's dispatches into
+/// CEF from it.
+extern "C" fn set_showing_on_ui_thread(param: *mut c_void) {
+    ffi_guard(
+        "set_showing_on_ui_thread",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            if param.is_null() {
+                return;
+            }
+            let state = unsafe { &mut *param.cast::<SetShowing>() };
+            let (Some(by_name), Some(release), Some(inc), Some(dec)) = (
+                obs_get_source_by_name(),
+                obs_source_release(),
+                obs_source_inc_showing(),
+                obs_source_dec_showing(),
+            ) else {
+                state.error = Some("required libobs symbols unavailable".into());
+                state.ran = true;
+                return;
+            };
+
+            // A poisoned lock would mean a previous panic mid-update; the
+            // slot's contents are then untrustworthy, so treat it as empty
+            // rather than propagating.
+            let mut forced = match FORCED_SHOWING.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+
+            // `dec` first, always: releasing whatever is held before taking
+            // a new reference keeps the invariant "at most one" true even
+            // if the second lookup below fails.
+            let drop_current = |forced: &mut Option<String>| {
+                let Some(held) = forced.take() else { return None };
+                if let Ok(c) = CString::new(held.as_str()) {
+                    let source = by_name(c.as_ptr());
+                    if !source.is_null() {
+                        dec(source);
+                        release(source);
+                    }
+                    // A null lookup means the source is already gone, which
+                    // took its showing count with it. Nothing to release.
+                }
+                Some(held)
+            };
+
+            if !state.want {
+                // Idempotent: asking to un-show something this plugin never
+                // forced is a no-op, not an error.
+                if forced.as_deref() == Some(state.name.as_str()) {
+                    drop_current(&mut forced);
+                }
+                state.ran = true;
+                return;
+            }
+
+            if forced.as_deref() == Some(state.name.as_str()) {
+                state.ran = true;
+                return;
+            }
+            state.released = drop_current(&mut forced);
+
+            let Ok(cname) = CString::new(state.name.as_str()) else {
+                state.error = Some("invalid source name".into());
+                state.ran = true;
+                return;
+            };
+            let source = by_name(cname.as_ptr());
+            if source.is_null() {
+                state.error = Some(format!("no source named '{}'", state.name));
+                state.ran = true;
+                return;
+            }
+            inc(source);
+            release(source);
+            *forced = Some(state.name.clone());
+            state.ran = true;
+        }),
+    );
+}
+
+extern "C" fn handle_set_source_showing(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_set_source_showing",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_set_source_showing_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{"source": "name", "showing": true|false}`. Response:
+/// `{"ok": true}`, plus `"released"` naming a different source this call
+/// had to let go of first.
+///
+/// Renders a source that no scene is showing, the way a projector window
+/// does — without opening a window.
+///
+/// WHY (measured 2026-08-20): obs-browser emits no frames at all while its
+/// source is not showing. FrameSW's browser-render preflight check creates
+/// a probe page in a utility scene nobody renders and screenshots it; that
+/// screenshot is black on a perfectly healthy install, so the check could
+/// never pass. `shutdown_on_invisible = false` does not help — it keeps the
+/// browser alive, it does not make it paint.
+///
+/// The alternatives were worse. A source projector works but puts a window
+/// on the operator's screen mid-show, and obs-websocket has no request to
+/// close one. Parking the probe in the live Preview scene works but writes
+/// a temporary item into a scene FrameSW manages and OBS persists.
+///
+/// Caller contract: pair every `true` with a `false`, or delete the source.
+/// The plugin holds at most one such reference (see `FORCED_SHOWING`).
+fn handle_set_source_showing_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let name = obs_data::get_string(request_data, "source").unwrap_or_default();
+    if name.is_empty() {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "missing source name");
+        return;
+    }
+    let Some(obs_queue_task) = obs_queue_task() else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_queue_task unavailable");
+        return;
+    };
+
+    let mut state = SetShowing {
+        ran: false,
+        name,
+        // Absent means `false`: the safe direction, since it releases.
+        want: obs_data::get_optional_bool(request_data, "showing").unwrap_or(false),
+        error: None,
+        released: None,
+    };
+    obs_queue_task(
+        OBS_TASK_UI,
+        set_showing_on_ui_thread,
+        (&mut state as *mut SetShowing).cast(),
+        true,
+    );
+
+    if !state.ran {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "UI-thread task did not run");
+        return;
+    }
+    if let Some(error) = &state.error {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", error);
+        return;
+    }
+    if let Some(released) = &state.released {
+        log_line(&format!(
+            "set_source_showing '{}' released previously forced '{released}'",
+            state.name
+        ));
+        obs_data::set_string(response_data, "released", released);
+    }
+    obs_data::set_bool(response_data, "ok", true);
+}
+
+// ---------------------------------------------------------------------
+// Graphics renderer (`set_renderer`)
+// ---------------------------------------------------------------------
+
+/// Carries a renderer read/write across the UI-thread hop. `set` is `None`
+/// for a pure read.
+struct Renderer {
+    ran: bool,
+    set: Option<String>,
+    value: String,
+    changed: bool,
+}
+
+/// Runs on OBS's UI thread — same reasoning as `projector_on_top_on_ui_thread`,
+/// except this one reaches the *app* config (global.ini) rather than the user
+/// config.
+extern "C" fn renderer_on_ui_thread(param: *mut c_void) {
+    ffi_guard(
+        "renderer_on_ui_thread",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            if param.is_null() {
+                return;
+            }
+            let state = unsafe { &mut *param.cast::<Renderer>() };
+            let (Some(get_app_config), Some(config_get_string)) =
+                (obs_frontend_get_app_config(), config_get_string())
+            else {
+                return;
+            };
+            let config = get_app_config();
+            if config.is_null() {
+                return;
+            }
+            let (Ok(section), Ok(key)) =
+                (CString::new(RENDERER_SECTION), CString::new(RENDERER_KEY))
+            else {
+                return;
+            };
+
+            // Copied immediately: `config_get_string` points into the config
+            // object's own storage, which the write below can invalidate.
+            let read = |config| {
+                let p = config_get_string(config, section.as_ptr(), key.as_ptr());
+                if p.is_null() {
+                    String::new()
+                } else {
+                    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+                }
+            };
+
+            let before = read(config);
+            if let Some(desired) = &state.set {
+                if desired != &before {
+                    let (Some(config_set_string), Ok(value)) =
+                        (config_set_string(), CString::new(desired.as_str()))
+                    else {
+                        return;
+                    };
+                    config_set_string(config, section.as_ptr(), key.as_ptr(), value.as_ptr());
+                    // Same reasoning as the projector handler: persist now
+                    // rather than trusting OBS's write-at-exit. It matters
+                    // more here — the caller's next move is to restart OBS.
+                    if let Some(config_save_safe) = config_save_safe() {
+                        let (Ok(tmp), Ok(bak)) = (CString::new("tmp"), CString::new("bak")) else {
+                            return;
+                        };
+                        config_save_safe(config, tmp.as_ptr(), bak.as_ptr());
+                    }
+                    state.changed = true;
+                }
+            }
+
+            state.value = read(config);
+            state.ran = true;
+        }),
+    );
+}
+
+extern "C" fn handle_renderer(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_renderer",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_renderer_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{}` to read, or `{"renderer": "Metal"}` to set. Response:
+/// `{"ok": true, "renderer": "...", "changed": bool}` — the value as it
+/// stands *after* any write, so the caller never assumes its write landed.
+///
+/// OBS Settings -> Advanced -> Video -> Renderer. The value is whatever
+/// string OBS itself writes ("Metal", "OpenGL", "Direct3D 11"); this plugin
+/// does not validate it, because the valid set is per-platform and per-OBS
+/// version and guessing wrong here would be worse than passing it through.
+///
+/// `changed: false` means it already held that value — the caller should
+/// not restart OBS on the strength of a no-op write.
+///
+/// Lives in the plugin because global.ini cannot be edited from outside
+/// while OBS runs: OBS holds it in memory and rewrites it at exit, silently
+/// discarding the edit. OBS reads the renderer once at startup, so even a
+/// successful write does nothing until it restarts.
+fn handle_renderer_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let Some(obs_queue_task) = obs_queue_task() else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_queue_task unavailable");
+        return;
+    };
+
+    let wanted = obs_data::get_string(request_data, "renderer").filter(|s| !s.is_empty());
+    let mut state = Renderer {
+        ran: false,
+        set: wanted,
+        value: String::new(),
+        changed: false,
+    };
+    obs_queue_task(
+        OBS_TASK_UI,
+        renderer_on_ui_thread,
+        (&mut state as *mut Renderer).cast(),
+        true,
+    );
+
+    if !state.ran {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "app config unavailable");
+        return;
+    }
+    if state.changed {
+        log_line(&format!("renderer set to '{}' (needs an OBS restart)", state.value));
+    }
+    obs_data::set_bool(response_data, "ok", true);
+    obs_data::set_string(response_data, "renderer", &state.value);
+    obs_data::set_bool(response_data, "changed", state.changed);
+}
+
 extern "C" fn handle_rescan_now(
     request_data: *mut c_void,
     response_data: *mut c_void,
@@ -1185,6 +1537,8 @@ pub extern "C" fn obs_module_post_load() {
             ("rescan_now", handle_rescan_now as calldata::RequestCallbackFn),
             ("pause_rescan", handle_pause_rescan as calldata::RequestCallbackFn),
             ("resume_rescan", handle_resume_rescan as calldata::RequestCallbackFn),
+            ("set_source_showing", handle_set_source_showing as calldata::RequestCallbackFn),
+            ("renderer", handle_renderer as calldata::RequestCallbackFn),
             ("tap_status", handle_tap_status as calldata::RequestCallbackFn),
             ("set_mix_sources", handle_set_mix_sources as calldata::RequestCallbackFn),
             ("stop_mix_bus", handle_stop_mix_bus as calldata::RequestCallbackFn),

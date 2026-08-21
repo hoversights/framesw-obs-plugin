@@ -141,6 +141,21 @@ pub fn speaker_layout_to_channels(speakers: u32) -> u32 {
 // ("PGM-A"/"PGM-B") is a direct name lookup, not the general rescan.
 crate::resolved_fn!(obs_get_source_by_name: extern "C" fn(*const c_char) -> *mut ObsSourceT);
 crate::resolved_fn!(obs_source_release: extern "C" fn(*mut ObsSourceT));
+
+// `libobs/obs.h`: the pair a projector window uses to say "render this
+// source even though no scene is showing it". They move a reference count,
+// so every `inc` needs exactly one matching `dec`.
+//
+// MEASURED 2026-08-20, and the reason `set_source_showing` exists at all:
+// obs-browser produces no frames whatsoever while its source is not
+// showing. A browser source parked in a scene nobody is rendering stays
+// black forever — on a healthy Metal renderer just as much as on a broken
+// one. FrameSW's browser-render preflight check screenshotted exactly such
+// a source and reported "browser sources are not rendering" on a machine
+// where a guest's screen share was live on screen. Forcing the probe
+// showing turns it magenta in under half a second.
+crate::resolved_fn!(obs_source_inc_showing: extern "C" fn(*mut ObsSourceT));
+crate::resolved_fn!(obs_source_dec_showing: extern "C" fn(*mut ObsSourceT));
 // CORRECTION (2026-07-31, second pass): an earlier comment here claimed
 // obs-websocket's `CreateScene` request was itself crashing OBS 32.1.2,
 // and blamed OBS 32.1's "partial"/"unstable" Canvas support. Both claims
@@ -210,9 +225,25 @@ pub const OBS_OUTPUT_VIDEO: u32 = 1 << 0;
 // clobbered. `obs_frontend_get_global_config` is the deprecated alias for
 // the same thing and is deliberately not used here.
 crate::resolved_fn!(obs_frontend_get_user_config: extern "C" fn() -> *mut ConfigT);
+
+// `frontend/api/obs-frontend-api.h`: `config_t *obs_frontend_get_app_config(void)`
+// — a DIFFERENT file from the user config above. OBS 30.2 split its settings
+// in two: user.ini (what `obs_frontend_get_user_config` returns) and
+// global.ini (this one). The graphics renderer lives in global.ini, so the
+// projector/NDI precedent does not reach it. Verified against a real
+// global.ini on 2026-08-20: `[Video] Renderer=Metal`.
+//
+// Older OBS has no such symbol — the resolver returns `None` and the caller
+// reports that rather than writing to the wrong file.
+crate::resolved_fn!(obs_frontend_get_app_config: extern "C" fn() -> *mut ConfigT);
+
 // `libobs/util/config-file.h`.
 crate::resolved_fn!(config_get_bool: extern "C" fn(*mut ConfigT, *const c_char, *const c_char) -> bool);
 crate::resolved_fn!(config_set_bool: extern "C" fn(*mut ConfigT, *const c_char, *const c_char, bool));
+// Returns a pointer into the config object's own storage — valid only until
+// the config changes, so copy it before doing anything else with `config`.
+crate::resolved_fn!(config_get_string: extern "C" fn(*mut ConfigT, *const c_char, *const c_char) -> *const c_char);
+crate::resolved_fn!(config_set_string: extern "C" fn(*mut ConfigT, *const c_char, *const c_char, *const c_char));
 crate::resolved_fn!(config_save_safe: extern "C" fn(*mut ConfigT, *const c_char, *const c_char) -> c_int);
 
 /// user.ini's `[BasicWindow] ProjectorAlwaysOnTop` — OBS Settings ->
@@ -241,6 +272,20 @@ pub const PROJECTOR_ON_TOP_KEY: &str = "ProjectorAlwaysOnTop";
 /// The keys exist whether or not DistroAV is installed — they're just inert
 /// without it, which is why the caller checks for the plugin separately
 /// rather than inferring it from a successful write here.
+/// global.ini's `[Video] Renderer` — OBS Settings -> Advanced -> Video ->
+/// Renderer. Verified against a real global.ini on 2026-08-20.
+///
+/// In the **app** config (global.ini), not the user config the two constants
+/// above use — see `obs_frontend_get_app_config`.
+///
+/// App-global and profile-independent, like `PROJECTOR_ON_TOP_SECTION`:
+/// changing it follows the operator into every other profile and scene
+/// collection, and OBS only reads it at startup, so a write here does
+/// nothing until OBS restarts. Both facts have to reach the operator before
+/// FrameSW writes it.
+pub const RENDERER_SECTION: &str = "Video";
+pub const RENDERER_KEY: &str = "Renderer";
+
 pub const NDI_SECTION: &str = "NDIPlugin";
 pub const NDI_MAIN_OUTPUT_KEY: &str = "MainOutputEnabled";
 pub const NDI_PREVIEW_OUTPUT_KEY: &str = "PreviewOutputEnabled";
