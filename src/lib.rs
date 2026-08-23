@@ -942,6 +942,158 @@ extern "C" fn set_showing_on_ui_thread(param: *mut c_void) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Waking OBS's browser engine (`warm_browser_engine`)
+// ---------------------------------------------------------------------------
+//
+// MEASURED 2026-08-22 on macOS 26.1 / OBS 32.1.2 / CEF 127: **OBS's CEF can
+// only spawn its first renderer process from OBS's own UI thread.**
+//
+// | how the browser source was created | thread | renderer |
+// |---|---|---|
+// | scene collection load at startup | OBS main | spawns |
+// | OBS's own Add Source dialog | OBS UI | spawns |
+// | obs-websocket `CreateInput` (5 attempts) | websocket worker | **never** |
+//
+// When it does not spawn, every browser source in that OBS session renders
+// black — every vdo guest, every screen share, every web overlay — with
+// nothing in any log. Only restarting OBS recovered it, which is why this
+// looked intermittent for weeks: a restart re-loads the scene collection on
+// the main thread, and by then a guest source was usually saved in it.
+//
+// So the app cannot fix this from outside: everything it does arrives on the
+// websocket thread by definition. Hence this request. It creates one browser
+// source on the UI thread, which is all CEF needs — once a renderer exists,
+// sources created later over websocket work normally (measured: painted in
+// one second).
+//
+// The source is PRIVATE and never released for the life of the OBS process:
+// private so it is never written into the user's scene collection, and held
+// so CEF cannot tear the renderer down again when the last browser closes.
+// It is never added to a scene, so it renders nowhere and costs a 16x16
+// texture.
+
+/// The warm-up source, held for the life of the OBS process. Raw pointer
+/// behind a mutex because it is only ever touched on the UI thread, and only
+/// to create it once.
+static WARM_SOURCE: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+struct WarmResult {
+    ran: bool,
+    already_warm: bool,
+    created: bool,
+    error: Option<String>,
+}
+
+/// Runs on OBS's UI thread, via `obs_queue_task(OBS_TASK_UI, ...)`. That is
+/// the entire point of this function — see the note above.
+extern "C" fn warm_browser_engine_on_ui_thread(param: *mut c_void) {
+    ffi_guard("warm_browser_engine_on_ui_thread", (), std::panic::AssertUnwindSafe(|| {
+        let state = unsafe { &mut *(param as *mut WarmResult) };
+        state.ran = true;
+
+        let mut held = match WARM_SOURCE.lock() {
+            Ok(h) => h,
+            Err(_) => {
+                state.error = Some("warm-source lock poisoned".into());
+                return;
+            }
+        };
+        if *held != 0 {
+            state.already_warm = true;
+            return;
+        }
+
+        let Some(obs_source_create_private) = obs_source_create_private() else {
+            state.error = Some("obs_source_create_private unavailable".into());
+            return;
+        };
+        let Some(obs_data_create) = obs_data::obs_data_create() else {
+            state.error = Some("obs_data_create unavailable".into());
+            return;
+        };
+
+        let settings = obs_data_create();
+        if settings.is_null() {
+            state.error = Some("could not allocate settings".into());
+            return;
+        }
+        // A local page: fetches nothing, works offline, and cannot make a
+        // network fault look like a dead browser engine.
+        obs_data::set_string(settings, "url", "about:blank");
+        obs_data::set_int(settings, "width", 16);
+        obs_data::set_int(settings, "height", 16);
+        // Never let OBS shut it down. This source is deliberately never
+        // visible, so `shutdown` true would tear it straight back down and
+        // take the renderer with it.
+        obs_data::set_bool(settings, "shutdown", false);
+        obs_data::set_bool(settings, "restart_when_active", false);
+        obs_data::set_bool(settings, "reroute_audio", false);
+
+        let id = CString::new("browser_source").unwrap();
+        let name = CString::new("FrameSW browser engine warm-up").unwrap();
+        let source = obs_source_create_private(id.as_ptr(), name.as_ptr(), settings);
+        obs_data::release(settings);
+
+        if source.is_null() {
+            state.error = Some("obs_source_create_private returned null".into());
+            return;
+        }
+        // Deliberately never released: holding it is what keeps CEF up.
+        *held = source as usize;
+        state.created = true;
+    }));
+}
+
+fn handle_warm_browser_engine_impl(
+    _request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let response_data = obs_data::from_void(response_data);
+    let Some(obs_queue_task) = obs_queue_task() else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_queue_task unavailable");
+        return;
+    };
+    let mut state = WarmResult { ran: false, already_warm: false, created: false, error: None };
+    // `wait: true` — the caller needs the answer, and the app's own
+    // browser-render probe runs straight after this.
+    obs_queue_task(
+        OBS_TASK_UI,
+        warm_browser_engine_on_ui_thread,
+        (&mut state as *mut WarmResult).cast(),
+        true,
+    );
+    if !state.ran {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "UI-thread task did not run");
+        return;
+    }
+    if let Some(error) = &state.error {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", error);
+        return;
+    }
+    obs_data::set_bool(response_data, "ok", true);
+    obs_data::set_bool(response_data, "created", state.created);
+    obs_data::set_bool(response_data, "already_warm", state.already_warm);
+}
+
+extern "C" fn handle_warm_browser_engine(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_warm_browser_engine",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_warm_browser_engine_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
 extern "C" fn handle_set_source_showing(
     request_data: *mut c_void,
     response_data: *mut c_void,
@@ -1538,6 +1690,7 @@ pub extern "C" fn obs_module_post_load() {
             ("pause_rescan", handle_pause_rescan as calldata::RequestCallbackFn),
             ("resume_rescan", handle_resume_rescan as calldata::RequestCallbackFn),
             ("set_source_showing", handle_set_source_showing as calldata::RequestCallbackFn),
+            ("warm_browser_engine", handle_warm_browser_engine as calldata::RequestCallbackFn),
             ("renderer", handle_renderer as calldata::RequestCallbackFn),
             ("tap_status", handle_tap_status as calldata::RequestCallbackFn),
             ("set_mix_sources", handle_set_mix_sources as calldata::RequestCallbackFn),

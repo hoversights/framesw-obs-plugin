@@ -142,6 +142,14 @@ pub fn speaker_layout_to_channels(speakers: u32) -> u32 {
 crate::resolved_fn!(obs_get_source_by_name: extern "C" fn(*const c_char) -> *mut ObsSourceT);
 crate::resolved_fn!(obs_source_release: extern "C" fn(*mut ObsSourceT));
 
+// libobs/obs.h: `obs_source_t *obs_source_create_private(const char *id,
+// const char *name, obs_data_t *settings)`.
+//
+// Private, not `obs_source_create`: a private source is never written into
+// the user's scene collection. The CEF warm-up must not leave anything
+// behind in their OBS config.
+crate::resolved_fn!(obs_source_create_private: extern "C" fn(*const c_char, *const c_char, *mut crate::obs_data::ObsDataT) -> *mut ObsSourceT);
+
 // `libobs/obs.h`: the pair a projector window uses to say "render this
 // source even though no scene is showing it". They move a reference count,
 // so every `inc` needs exactly one matching `dec`.

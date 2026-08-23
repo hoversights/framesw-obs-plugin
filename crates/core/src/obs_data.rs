@@ -34,6 +34,7 @@ crate::resolved_fn!(obs_data_create: extern "C" fn() -> *mut ObsDataT);
 crate::resolved_fn!(obs_data_release: extern "C" fn(*mut ObsDataT));
 crate::resolved_fn!(obs_data_set_string: extern "C" fn(*mut ObsDataT, *const c_char, *const c_char));
 crate::resolved_fn!(obs_data_set_double: extern "C" fn(*mut ObsDataT, *const c_char, f64));
+crate::resolved_fn!(obs_data_set_int: extern "C" fn(*mut ObsDataT, *const c_char, i64));
 crate::resolved_fn!(obs_data_set_bool: extern "C" fn(*mut ObsDataT, *const c_char, bool));
 crate::resolved_fn!(obs_data_set_array: extern "C" fn(*mut ObsDataT, *const c_char, *mut ObsDataArrayT));
 crate::resolved_fn!(obs_data_array_create: extern "C" fn() -> *mut ObsDataArrayT);
@@ -269,6 +270,19 @@ pub fn set_string(data: *mut ObsDataT, key: &str, value: &str) {
 }
 
 /// `obs_data_set_bool`, same no-op-on-failure shape as `set_string`.
+/// Sets an integer setting. Separate from `set_double` because OBS reads
+/// these back with `obs_data_get_int`, which does not see a double.
+pub fn set_int(data: *mut ObsDataT, key: &str, value: i64) {
+    let Some(obs_data_set_int) = self::obs_data_set_int() else {
+        return;
+    };
+    if data.is_null() {
+        return;
+    }
+    let key = cstr(key);
+    obs_data_set_int(data, key.as_ptr(), value);
+}
+
 pub fn set_bool(data: *mut ObsDataT, key: &str, value: bool) {
     let Some(obs_data_set_bool) = self::obs_data_set_bool() else {
         return;
