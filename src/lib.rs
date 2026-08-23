@@ -967,16 +967,15 @@ extern "C" fn set_showing_on_ui_thread(param: *mut c_void) {
 // sources created later over websocket work normally (measured: painted in
 // one second).
 //
-// The source is PRIVATE and never released for the life of the OBS process:
-// private so it is never written into the user's scene collection, and held
-// so CEF cannot tear the renderer down again when the last browser closes.
-// It is never added to a scene, so it renders nowhere and costs a 16x16
-// texture.
+// The source is PRIVATE, so it is never written into the user's scene
+// collection, is never added to a scene, and is RELEASED IMMEDIATELY. What
+// survives is CEF's browser-process initialisation, which is all that was
+// ever missing. Holding the source instead crashes OBS at shutdown — see the
+// note at the release site.
 
-/// The warm-up source, held for the life of the OBS process. Raw pointer
-/// behind a mutex because it is only ever touched on the UI thread, and only
-/// to create it once.
-static WARM_SOURCE: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+/// Whether this OBS process has already been warmed. CEF only needs it once,
+/// and FrameSW calls this on every connect.
+static ALREADY_WARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct WarmResult {
     ran: bool,
@@ -992,14 +991,7 @@ extern "C" fn warm_browser_engine_on_ui_thread(param: *mut c_void) {
         let state = unsafe { &mut *(param as *mut WarmResult) };
         state.ran = true;
 
-        let mut held = match WARM_SOURCE.lock() {
-            Ok(h) => h,
-            Err(_) => {
-                state.error = Some("warm-source lock poisoned".into());
-                return;
-            }
-        };
-        if *held != 0 {
+        if ALREADY_WARMED.load(Ordering::Relaxed) {
             state.already_warm = true;
             return;
         }
@@ -1039,8 +1031,27 @@ extern "C" fn warm_browser_engine_on_ui_thread(param: *mut c_void) {
             state.error = Some("obs_source_create_private returned null".into());
             return;
         }
-        // Deliberately never released: holding it is what keeps CEF up.
-        *held = source as usize;
+        // Released immediately, and it must be.
+        //
+        // What actually persists is CEF's browser-process initialisation,
+        // not this source and not a renderer. MEASURED 2026-08-22: after
+        // this call the renderer count is still 0 — and a browser source
+        // created straight afterwards over obs-websocket paints within one
+        // second and spawns its own renderer. Three consecutive cold OBS
+        // starts, identical result.
+        //
+        // HOLDING IT CRASHES OBS. The first version of this kept the source
+        // for the life of the process, on the theory that CEF would tear the
+        // renderer down otherwise. It produced three EXC_BREAKPOINT crashes
+        // in obs-browser's `obs_module_unload`, inside CEF, every single
+        // time OBS quit: shutting CEF down with a browser still outstanding
+        // trips one of its internal CHECKs. Do not reintroduce a long-lived
+        // reference here — FrameSW's first rule is that it must never
+        // destabilise OBS.
+        if let Some(obs_source_release) = obs_source_release() {
+            obs_source_release(source);
+        }
+        ALREADY_WARMED.store(true, Ordering::Relaxed);
         state.created = true;
     }));
 }
