@@ -157,19 +157,27 @@ pub fn get_optional_bool(data: *mut ObsDataT, key: &str) -> Option<bool> {
     Some(obs_data_get_bool(data, key.as_ptr()))
 }
 
-/// One `{name, kind}` pair for `set_pair_array`.
+/// One name/value pair for `set_pair_array`. The second field's JSON key is
+/// chosen by the caller, so a device id is not shipped under a key called
+/// "kind" — a field whose name lies about what it holds is how a reader ends
+/// up matching the wrong thing.
 pub struct NamedKind {
     pub name: String,
     pub kind: String,
 }
 
-/// Attaches `key: [{"name": ..., "kind": ...}, ...]` to an existing
+/// Attaches `key: [{"name": ..., <second_key>: ...}, ...]` to an existing
 /// `obs_data_t*` (a vendor request's `response_data`, unlike
 /// `build_levels_payload`, which creates its own root). Returns false if
 /// any required `obs_data_*` symbol is unresolvable, so the caller can
 /// report a real error instead of silently answering with an empty list —
 /// "no active outputs" and "couldn't look" must stay distinguishable.
-pub fn set_pair_array(data: *mut ObsDataT, key: &str, items: &[NamedKind]) -> bool {
+pub fn set_pair_array(
+    data: *mut ObsDataT,
+    key: &str,
+    second_key: &str,
+    items: &[NamedKind],
+) -> bool {
     let (
         Some(obs_data_create),
         Some(obs_data_release),
@@ -197,7 +205,7 @@ pub fn set_pair_array(data: *mut ObsDataT, key: &str, items: &[NamedKind]) -> bo
         let name_key = cstr("name");
         let name_val = cstr(&item.name);
         obs_data_set_string(entry, name_key.as_ptr(), name_val.as_ptr());
-        let kind_key = cstr("kind");
+        let kind_key = cstr(second_key);
         let kind_val = cstr(&item.kind);
         obs_data_set_string(entry, kind_key.as_ptr(), kind_val.as_ptr());
         // Same refcount convention as `build_levels_payload`: push_back

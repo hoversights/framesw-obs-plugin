@@ -207,6 +207,134 @@ crate::resolved_fn!(obs_frontend_get_current_scene: extern "C" fn() -> *mut ObsS
 crate::resolved_fn!(obs_frontend_get_current_preview_scene: extern "C" fn() -> *mut ObsSourceT);
 crate::resolved_fn!(obs_frontend_preview_program_mode_active: extern "C" fn() -> bool);
 
+// `libobs/obs.h`: `bool obs_set_audio_monitoring_device(const char *name,
+// const char *id)` — the call OBS's own Settings dialog makes when the
+// Monitoring Device is changed. It re-opens the monitoring output there and
+// then, which is the whole reason this is here.
+//
+// Writing `Audio/MonitoringDeviceName` through obs-websocket's
+// `SetProfileParameter` does NOT do this. Measured 2026-08-24: the request
+// returned success, the value read back changed, and OBS logged no
+// monitoring-device change at all — the config moved and the audio did not.
+// The same "silently succeeds while doing nothing" shape that makes
+// wrong-thread frontend calls so dangerous.
+crate::resolved_fn!(obs_set_audio_monitoring_device: extern "C" fn(*const c_char, *const c_char) -> bool);
+
+// `libobs/obs.h`: `bool obs_get_audio_monitoring_device(const char **name,
+// const char **id)` — the device OBS is monitoring through *right now*.
+//
+// Deliberately paired with the setter. The profile config and the running
+// device are two different things: `obs_set_audio_monitoring_device` changes
+// the live one and does not write config, while `SetProfileParameter` writes
+// config and does not touch the live one. Reading the runtime value back is
+// the only way a caller can tell what is actually in effect rather than what
+// somebody wrote down.
+crate::resolved_fn!(obs_get_audio_monitoring_device: extern "C" fn(*mut *const c_char, *mut *const c_char));
+
+// `libobs/obs.h`: `void obs_enum_audio_monitoring_devices(
+// obs_enum_audio_device_cb cb, void *data)`, where the callback is
+// `bool (*)(void *data, const char *name, const char *id)` and returning
+// false stops the walk.
+//
+// This is the authoritative list: OBS needs a device *name and id* pair,
+// and enumerating any other way (cpal, CoreAudio directly) yields names
+// that then have to be matched back to ids by string — which is exactly how
+// you end up setting the wrong device.
+pub type ObsEnumAudioDeviceCb =
+    extern "C" fn(data: *mut c_void, name: *const c_char, id: *const c_char) -> bool;
+crate::resolved_fn!(obs_enum_audio_monitoring_devices: extern "C" fn(ObsEnumAudioDeviceCb, *mut c_void));
+
+
+// --- audio monitoring device -------------------------------------------
+
+/// Read/write state for `monitoring_device_on_ui_thread`.
+#[derive(Default)]
+pub struct MonitoringDevice {
+    /// Set this to change the device; leave `None` to only read.
+    pub wanted: Option<(String, String)>,
+    /// True once the UI-thread task actually ran.
+    pub ran: bool,
+    /// What `obs_set_audio_monitoring_device` returned, if a write was asked.
+    pub applied: bool,
+    /// Every device OBS will accept, as (name, id).
+    pub devices: Vec<(String, String)>,
+    /// What OBS is actually monitoring through after this task ran — the
+    /// live device, not what the profile says.
+    pub current: Option<(String, String)>,
+}
+
+extern "C" fn collect_monitoring_device(
+    data: *mut c_void,
+    name: *const c_char,
+    id: *const c_char,
+) -> bool {
+    if data.is_null() {
+        return false;
+    }
+    let out = unsafe { &mut *data.cast::<Vec<(String, String)>>() };
+    let name = if name.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned()
+    };
+    let id = if id.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(id) }.to_string_lossy().into_owned()
+    };
+    out.push((name, id));
+    true
+}
+
+/// Sets and/or enumerates OBS's audio monitoring device, on OBS's UI thread.
+///
+/// On the UI thread deliberately. `obs_set_audio_monitoring_device` tears
+/// down and re-creates the monitoring output, which is frontend-owned state;
+/// the plugin's other frontend calls are queued the same way and for the same
+/// reason.
+pub extern "C" fn monitoring_device_on_ui_thread(param: *mut c_void) {
+    if param.is_null() {
+        return;
+    }
+    let state = unsafe { &mut *param.cast::<MonitoringDevice>() };
+    state.ran = true;
+
+    if let Some((name, id)) = state.wanted.clone() {
+        if let (Ok(name), Ok(id), Some(set)) = (
+            CString::new(name),
+            CString::new(id),
+            obs_set_audio_monitoring_device(),
+        ) {
+            state.applied = set(name.as_ptr(), id.as_ptr());
+        }
+    }
+
+    if let Some(get) = obs_get_audio_monitoring_device() {
+        let mut name: *const c_char = std::ptr::null();
+        let mut id: *const c_char = std::ptr::null();
+        get(&mut name, &mut id);
+        if !name.is_null() || !id.is_null() {
+            let to_s = |p: *const c_char| {
+                if p.is_null() {
+                    String::new()
+                } else {
+                    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+                }
+            };
+            state.current = Some((to_s(name), to_s(id)));
+        }
+    }
+
+    if let Some(enum_devices) = obs_enum_audio_monitoring_devices() {
+        let mut found: Vec<(String, String)> = Vec::new();
+        enum_devices(
+            collect_monitoring_device,
+            (&mut found as *mut Vec<(String, String)>).cast(),
+        );
+        state.devices = found;
+    }
+}
+
 /// `enum obs_task_type`'s first variant in libobs/obs.h — run on OBS's
 /// Qt UI thread.
 pub const OBS_TASK_UI: c_int = 0;

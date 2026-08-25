@@ -409,7 +409,7 @@ fn handle_list_video_outputs_impl(
         collect_video_output,
         (&mut outputs as *mut Vec<obs_data::NamedKind>).cast(),
     );
-    if !obs_data::set_pair_array(response_data, "outputs", &outputs) {
+    if !obs_data::set_pair_array(response_data, "outputs", "kind", &outputs) {
         obs_data::set_bool(response_data, "ok", false);
         obs_data::set_string(response_data, "error", "obs_data array symbols unavailable");
         return;
@@ -643,6 +643,105 @@ extern "C" fn ndi_outputs_on_ui_thread(param: *mut c_void) {
             state.ran = true;
         }),
     );
+}
+
+extern "C" fn handle_monitoring_device(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_monitoring_device",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_monitoring_device_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{}` to enumerate, or `{"name": str, "id": str}` to set.
+/// Response: `{"ok": bool, "applied": bool, "devices": [{"name","id"}]}` —
+/// the device list is always returned, so one round trip both sets and
+/// refreshes the picker.
+///
+/// Why this exists at all: obs-websocket's `SetProfileParameter` on
+/// `Audio/MonitoringDeviceName` writes the config and **does not re-open the
+/// monitoring output**. Measured 2026-08-24 — the request returned success,
+/// the value read back changed, and OBS logged no monitoring-device change.
+/// `obs_set_audio_monitoring_device` is what OBS's own Settings dialog calls,
+/// and it applies immediately.
+///
+/// Enumeration matters as much as the write. OBS wants a name *and* an id,
+/// and any other source of device names (cpal, CoreAudio) has to be matched
+/// back to ids by string comparison — which is how the wrong device gets
+/// selected on a machine with two similarly named outputs.
+fn handle_monitoring_device_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+    let Some(obs_queue_task) = obs_queue_task() else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_queue_task unavailable");
+        return;
+    };
+
+    // Both or neither: setting a name without its id, or the reverse, is a
+    // request we cannot honour correctly, so refuse rather than guess.
+    let name = obs_data::get_string(request_data, "name");
+    let id = obs_data::get_string(request_data, "id");
+    let wanted = match (name, id) {
+        (Some(n), Some(i)) => Some((n, i)),
+        (None, None) => None,
+        _ => {
+            obs_data::set_bool(response_data, "ok", false);
+            obs_data::set_string(
+                response_data,
+                "error",
+                "both \"name\" and \"id\" are required to set a device",
+            );
+            return;
+        }
+    };
+
+    let mut state = studio_mode_meters_core::metering::MonitoringDevice {
+        wanted,
+        ..Default::default()
+    };
+    obs_queue_task(
+        OBS_TASK_UI,
+        studio_mode_meters_core::metering::monitoring_device_on_ui_thread,
+        (&mut state as *mut studio_mode_meters_core::metering::MonitoringDevice).cast(),
+        true,
+    );
+
+    if !state.ran {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "UI-thread task did not run");
+        return;
+    }
+
+    let devices: Vec<obs_data::NamedKind> = state
+        .devices
+        .iter()
+        .map(|(name, id)| obs_data::NamedKind {
+            name: name.clone(),
+            kind: id.clone(),
+        })
+        .collect();
+    if !obs_data::set_pair_array(response_data, "devices", "id", &devices) {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_data array symbols unavailable");
+        return;
+    }
+    if let Some((name, id)) = &state.current {
+        obs_data::set_string(response_data, "current_name", name);
+        obs_data::set_string(response_data, "current_id", id);
+    }
+    obs_data::set_bool(response_data, "applied", state.applied);
+    obs_data::set_bool(response_data, "ok", true);
 }
 
 extern "C" fn handle_ndi_outputs(
@@ -1697,6 +1796,7 @@ pub extern "C" fn obs_module_post_load() {
             ("projector_on_top", handle_projector_on_top as calldata::RequestCallbackFn),
             ("ensure_profile", handle_ensure_profile as calldata::RequestCallbackFn),
             ("ndi_outputs", handle_ndi_outputs as calldata::RequestCallbackFn),
+            ("monitoring_device", handle_monitoring_device as calldata::RequestCallbackFn),
             ("rescan_now", handle_rescan_now as calldata::RequestCallbackFn),
             ("pause_rescan", handle_pause_rescan as calldata::RequestCallbackFn),
             ("resume_rescan", handle_resume_rescan as calldata::RequestCallbackFn),
