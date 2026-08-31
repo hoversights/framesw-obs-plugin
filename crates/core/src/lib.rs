@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! Plumbing shared by every plugin built from this repo.
+//! Plumbing for the plugins built from this repo.
 //!
-//! Split out so the community metering plugin
-//! (`hoversights/obs-studio-mode-meters`) and FrameSW's own companion
-//! plugin build on one copy of the FFI-critical code rather than two that
-//! drift. Everything here is deliberately free of FrameSW specifics: no
-//! vendor name, no log prefix, no scene names. A consumer supplies those.
+//! Deliberately free of FrameSW specifics: no vendor name, no log prefix,
+//! no scene names. A consumer supplies those via `set_identity`.
+//!
+//! # A second copy of this code exists — fix bugs in both
+//!
+//! `hoversights/obs-studio-mode-meters` used to consume this crate by git
+//! revision, pinned at `a32dcac`. It no longer does. On 2026-08-30 that
+//! plugin took its own copy and cut the dependency, because a community
+//! plugin strangers load into their own OBS should not need this
+//! repository in order to build, or move on FrameSW's release schedule.
+//!
+//! The copies are deliberately **not** identical. Theirs is a subset:
+//! everything serving a vendor request, an NDI audio tap, or an OBS config
+//! write was removed there, and each removal left a comment where the code
+//! was. But the FFI declarations, the refcount conventions and the metering
+//! callback are shared ancestry, and a mistake in any of them crashes OBS
+//! itself rather than just the plugin.
+//!
+//! **So: a fix to anything FFI-critical here almost certainly applies over
+//! there too, and vice versa.** There is no tooling that will remind you.
+//! The same warning is at the top of the other copy.
 //!
 //! Nothing in this crate reads or writes OBS state beyond what it is handed
-//! — that property is what lets the public plugin be described honestly as
-//! read-only.
+//! — that property is what let the public plugin be described honestly as
+//! read-only, and it is worth keeping true.
 
 pub mod calldata;
 pub mod obs_data;
