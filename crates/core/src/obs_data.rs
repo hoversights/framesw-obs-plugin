@@ -31,6 +31,12 @@ pub enum ObsDataT {}
 pub enum ObsDataArrayT {}
 
 crate::resolved_fn!(obs_data_create: extern "C" fn() -> *mut ObsDataT);
+// `libobs/obs-data.h`: `obs_data_t *obs_data_create_from_json(const char
+// *json_string)`. Lets a caller hand through a settings blob verbatim
+// rather than this crate having to know every key a source kind wants —
+// macOS's `screen_capture` needs `type: 1` before it will list windows,
+// and that is the source kind's business, not ours.
+crate::resolved_fn!(obs_data_create_from_json: extern "C" fn(*const c_char) -> *mut ObsDataT);
 crate::resolved_fn!(obs_data_release: extern "C" fn(*mut ObsDataT));
 crate::resolved_fn!(obs_data_set_string: extern "C" fn(*mut ObsDataT, *const c_char, *const c_char));
 crate::resolved_fn!(obs_data_set_double: extern "C" fn(*mut ObsDataT, *const c_char, f64));

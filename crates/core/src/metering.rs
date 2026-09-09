@@ -150,6 +150,138 @@ crate::resolved_fn!(obs_source_release: extern "C" fn(*mut ObsSourceT));
 // behind in their OBS config.
 crate::resolved_fn!(obs_source_create_private: extern "C" fn(*const c_char, *const c_char, *mut crate::obs_data::ObsDataT) -> *mut ObsSourceT);
 
+// libobs/obs-properties.h — reading a source kind's device list WITHOUT
+// putting a source in anyone's scene.
+//
+// WHY THIS EXISTS. FrameSW used to enumerate cameras, NDI feeds and
+// capture windows by creating a real input (`__probe_camera_device` and
+// friends) in a utility scene over obs-websocket, reading its property
+// list, and leaving it there. Those probes were never cleaned up, so every
+// install accumulated them — and because OBS generates a hotkey row per
+// scene item and per audio source, three probes alone contributed 14 rows
+// to Settings -> Hotkeys before the user had made a single shot.
+//
+// A private source is never written into the user's scene collection and
+// never joins a scene, so it cannot appear there. `obs_source_properties`
+// builds the same property list either way: the list comes from the source
+// kind querying the system, not from the source being visible.
+// Opaque, like `ObsSourceT` above — never constructed, only pointed at.
+pub enum ObsPropertiesT {}
+pub enum ObsPropertyT {}
+
+crate::resolved_fn!(obs_source_properties: extern "C" fn(*const ObsSourceT) -> *mut ObsPropertiesT);
+crate::resolved_fn!(obs_properties_get: extern "C" fn(*mut ObsPropertiesT, *const c_char) -> *mut ObsPropertyT);
+crate::resolved_fn!(obs_properties_destroy: extern "C" fn(*mut ObsPropertiesT));
+crate::resolved_fn!(obs_property_list_item_count: extern "C" fn(*mut ObsPropertyT) -> usize);
+crate::resolved_fn!(obs_property_list_item_name: extern "C" fn(*mut ObsPropertyT, usize) -> *const c_char);
+crate::resolved_fn!(obs_property_list_item_string: extern "C" fn(*mut ObsPropertyT, usize) -> *const c_char);
+// A list property's values are not always strings. macOS's `screen_capture`
+// numbers its windows, so reading them with `..._item_string` returns an
+// empty string for every entry and the list looks empty when it is not —
+// measured 2026-09-09: 23 items found, 0 readable, until this was added.
+crate::resolved_fn!(obs_property_list_item_int: extern "C" fn(*mut ObsPropertyT, usize) -> i64);
+// `enum obs_combo_format` in libobs/obs-properties.h. Reported back in the
+// vendor response, but deliberately NOT branched on: MEASURED 2026-09-09
+// against OBS 31, `screen_capture`'s int-valued window list reports 1 and
+// `av_capture_input_v2`'s string-valued device list reports 3 — not the
+// 1/2 an INT,STRING ordering would give. Reading string-then-int needs no
+// correct answer to that question, so it cannot be wrong about it.
+crate::resolved_fn!(obs_property_list_format: extern "C" fn(*mut ObsPropertyT) -> i32);
+
+/// Every `(display name, device id)` in one list property of one source
+/// kind, read through a throwaway private source.
+///
+/// MUST RUN ON THE OBS UI THREAD. Building properties for a capture kind
+/// enumerates OS devices, which is exactly the class of work that either
+/// crashes or silently returns nothing off-thread.
+///
+/// Returns `None` only when a symbol is unresolvable or the source cannot
+/// be created — "could not look" and "looked, found nothing" must stay
+/// distinguishable, because an empty camera list is a legitimate answer.
+pub fn enumerate_list_property(
+    kind: &str,
+    property: &str,
+    settings: *mut crate::obs_data::ObsDataT,
+) -> Option<Vec<(String, String)>> {
+    enumerate_list_property_diag(kind, property, settings).map(|(v, _, _, _)| v)
+}
+
+/// As `enumerate_list_property`, plus `(found_property, raw_item_count)`.
+/// An empty result has two very different causes — the kind does not offer
+/// that property at all, or it offers it and the system reported nothing —
+/// and telling them apart is the difference between a bug and a fact.
+pub fn enumerate_list_property_diag(
+    kind: &str,
+    property: &str,
+    settings: *mut crate::obs_data::ObsDataT,
+) -> Option<(Vec<(String, String)>, bool, usize, i32)> {
+    let obs_source_create_private = obs_source_create_private()?;
+    let obs_source_release = obs_source_release()?;
+    let obs_source_properties = obs_source_properties()?;
+    let obs_properties_get = obs_properties_get()?;
+    let obs_properties_destroy = obs_properties_destroy()?;
+    let count = obs_property_list_item_count()?;
+    let item_name = obs_property_list_item_name()?;
+    let item_string = obs_property_list_item_string()?;
+    let item_int = obs_property_list_item_int()?;
+    let list_format = obs_property_list_format()?;
+
+    let id = std::ffi::CString::new(kind).ok()?;
+    let name = std::ffi::CString::new(format!("__framesw_enum_{kind}")).ok()?;
+    let prop_key = std::ffi::CString::new(property).ok()?;
+
+    let source = obs_source_create_private(id.as_ptr(), name.as_ptr(), settings);
+    if source.is_null() {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    let mut found = false;
+    let mut raw = 0usize;
+    let mut fmt = 0i32;
+    let props = obs_source_properties(source);
+    if !props.is_null() {
+        let prop = obs_properties_get(props, prop_key.as_ptr());
+        if !prop.is_null() {
+            found = true;
+            raw = count(prop);
+            fmt = list_format(prop);
+            for i in 0..raw {
+                let n = item_name(prop, i);
+                if n.is_null() {
+                    continue;
+                }
+                let name = unsafe { std::ffi::CStr::from_ptr(n).to_string_lossy().into_owned() };
+                // Try the string reading first and fall back to the integer
+                // one, rather than switching on `fmt`: that keeps this
+                // correct even if the enum's numbering ever differs from
+                // what was measured, and an int list simply yields "" here.
+                let v = item_string(prop, i);
+                let value = if v.is_null() {
+                    String::new()
+                } else {
+                    unsafe { std::ffi::CStr::from_ptr(v).to_string_lossy().into_owned() }
+                };
+                let value = if value.is_empty() {
+                    let n = item_int(prop, i);
+                    if n == 0 { String::new() } else { n.to_string() }
+                } else {
+                    value
+                };
+                if !value.is_empty() {
+                    out.push((name, value));
+                }
+            }
+        }
+        obs_properties_destroy(props);
+    }
+    // Released unconditionally, including on every early return above this
+    // point being impossible by construction: nothing between the create
+    // and here can return early.
+    obs_source_release(source);
+    Some((out, found, raw, fmt))
+}
+
 // `libobs/obs.h`: the pair a projector window uses to say "render this
 // source even though no scene is showing it". They move a reference count,
 // so every `inc` needs exactly one matching `dec`.

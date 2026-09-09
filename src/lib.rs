@@ -744,6 +744,161 @@ fn handle_monitoring_device_impl(
     obs_data::set_bool(response_data, "ok", true);
 }
 
+/// State for one `list_devices` round trip. Lives on the calling thread's
+/// stack; the UI-thread task fills it in before `obs_queue_task` returns.
+struct ListDevices {
+    ran: bool,
+    kind: String,
+    property: String,
+    settings_json: Option<String>,
+    devices: Option<Vec<(String, String)>>,
+    found_property: bool,
+    raw_count: usize,
+    list_format: i32,
+    error: Option<String>,
+}
+
+/// Runs on OBS's UI thread. Building a capture kind's properties
+/// enumerates OS devices, which off-thread either crashes or quietly
+/// returns nothing — the failure mode this plugin exists to avoid.
+extern "C" fn list_devices_on_ui_thread(param: *mut c_void) {
+    ffi_guard("list_devices_on_ui_thread", (), std::panic::AssertUnwindSafe(|| {
+        let state = unsafe { &mut *(param as *mut ListDevices) };
+        state.ran = true;
+
+        // Some kinds only populate their list once a setting is right:
+        // macOS's `screen_capture` reports no windows until `type` is 1.
+        // Passed through verbatim rather than interpreted here.
+        let settings = match state.settings_json.as_deref() {
+            None => std::ptr::null_mut(),
+            Some(json) => {
+                let Some(create) = obs_data::obs_data_create_from_json() else {
+                    state.error = Some("obs_data_create_from_json unavailable".into());
+                    return;
+                };
+                let Ok(c) = CString::new(json) else {
+                    state.error = Some("settings json contained a NUL".into());
+                    return;
+                };
+                create(c.as_ptr())
+            }
+        };
+
+        match enumerate_list_property_diag(&state.kind, &state.property, settings) {
+            Some((devices, found, raw, fmt)) => {
+                state.devices = Some(devices);
+                state.found_property = found;
+                state.raw_count = raw;
+                state.list_format = fmt;
+            }
+            None => state.devices = None,
+        }
+        if !settings.is_null() {
+            obs_data::release(settings);
+        }
+        if state.devices.is_none() {
+            state.error = Some(format!(
+                "could not build properties for kind \"{}\"",
+                state.kind
+            ));
+        }
+    }));
+}
+
+extern "C" fn handle_list_devices(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_list_devices",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_list_devices_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{"kind": "av_capture_input_v2", "property": "device",
+/// "settings": "{...}"}` — `settings` optional, a JSON *string*.
+/// Response: `{"ok": true, "devices": [{"name": ..., "value": ...}, ...]}`.
+///
+/// Replaces the `__probe_*` inputs FrameSW used to leave in a utility
+/// scene forever. See `metering::enumerate_list_property` for why a
+/// private source answers the same question without being an object the
+/// user's OBS has to carry.
+fn handle_list_devices_impl(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let request_data = obs_data::from_void(request_data);
+    let response_data = obs_data::from_void(response_data);
+
+    let (Some(kind), Some(property)) = (
+        obs_data::get_string(request_data, "kind"),
+        obs_data::get_string(request_data, "property"),
+    ) else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "kind and property are required");
+        return;
+    };
+    let Some(obs_queue_task) = obs_queue_task() else {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "obs_queue_task unavailable");
+        return;
+    };
+
+    let mut state = ListDevices {
+        ran: false,
+        kind,
+        property,
+        settings_json: obs_data::get_string(request_data, "settings"),
+        devices: None,
+        found_property: false,
+        raw_count: 0,
+        list_format: 0,
+        error: None,
+    };
+    obs_queue_task(
+        OBS_TASK_UI,
+        list_devices_on_ui_thread,
+        (&mut state as *mut ListDevices).cast(),
+        true,
+    );
+
+    if !state.ran {
+        obs_data::set_bool(response_data, "ok", false);
+        obs_data::set_string(response_data, "error", "UI-thread task never ran");
+        return;
+    }
+    match state.devices {
+        Some(devices) => {
+            let items: Vec<obs_data::NamedKind> = devices
+                .into_iter()
+                .map(|(name, value)| obs_data::NamedKind { name, kind: value })
+                .collect();
+            obs_data::set_bool(response_data, "found_property", state.found_property);
+            obs_data::set_int(response_data, "raw_count", state.raw_count as i64);
+            obs_data::set_int(response_data, "list_format", state.list_format as i64);
+            if obs_data::set_pair_array(response_data, "devices", "value", &items) {
+                obs_data::set_bool(response_data, "ok", true);
+            } else {
+                obs_data::set_bool(response_data, "ok", false);
+                obs_data::set_string(response_data, "error", "could not build the device array");
+            }
+        }
+        None => {
+            obs_data::set_bool(response_data, "ok", false);
+            obs_data::set_string(
+                response_data,
+                "error",
+                state.error.as_deref().unwrap_or("enumeration failed"),
+            );
+        }
+    }
+}
+
 extern "C" fn handle_ndi_outputs(
     request_data: *mut c_void,
     response_data: *mut c_void,
@@ -1796,6 +1951,7 @@ pub extern "C" fn obs_module_post_load() {
             ("projector_on_top", handle_projector_on_top as calldata::RequestCallbackFn),
             ("ensure_profile", handle_ensure_profile as calldata::RequestCallbackFn),
             ("ndi_outputs", handle_ndi_outputs as calldata::RequestCallbackFn),
+            ("list_devices", handle_list_devices as calldata::RequestCallbackFn),
             ("monitoring_device", handle_monitoring_device as calldata::RequestCallbackFn),
             ("rescan_now", handle_rescan_now as calldata::RequestCallbackFn),
             ("pause_rescan", handle_pause_rescan as calldata::RequestCallbackFn),
