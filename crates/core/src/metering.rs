@@ -227,7 +227,17 @@ pub fn enumerate_list_property_diag(
     let list_format = obs_property_list_format()?;
 
     let id = std::ffi::CString::new(kind).ok()?;
-    let name = std::ffi::CString::new(format!("__framesw_enum_{kind}")).ok()?;
+    // Named to explain itself in OBS's log. A capture kind logs its own
+    // complaints against the source it is configuring — `dshow_input` emits
+    // "DecodeDeviceId failed" / "Video configuration failed" for a device it
+    // is only being asked to describe — so this name is read by someone
+    // debugging something else entirely, months from now, with no idea what
+    // created it. `__framesw_enum_dshow_input` told them nothing and, being
+    // per-enumeration rather than once at startup, read like a leak.
+    let name = std::ffi::CString::new(format!(
+        "FrameSW device-list probe (temporary, not a shot) - {kind}"
+    ))
+    .ok()?;
     let prop_key = std::ffi::CString::new(property).ok()?;
 
     let source = obs_source_create_private(id.as_ptr(), name.as_ptr(), settings);
