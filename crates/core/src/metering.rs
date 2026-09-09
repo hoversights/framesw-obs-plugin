@@ -203,7 +203,7 @@ pub fn enumerate_list_property(
     property: &str,
     settings: *mut crate::obs_data::ObsDataT,
 ) -> Option<Vec<(String, String)>> {
-    enumerate_list_property_diag(kind, property, settings).map(|(v, _, _, _)| v)
+    enumerate_list_property_diag(kind, property, settings).map(|(v, _, _, _, _)| v)
 }
 
 /// As `enumerate_list_property`, plus `(found_property, raw_item_count)`.
@@ -214,7 +214,7 @@ pub fn enumerate_list_property_diag(
     kind: &str,
     property: &str,
     settings: *mut crate::obs_data::ObsDataT,
-) -> Option<(Vec<(String, String)>, bool, usize, i32)> {
+) -> Option<(Vec<(String, String)>, bool, usize, i32, bool)> {
     let obs_source_create_private = obs_source_create_private()?;
     let obs_source_release = obs_source_release()?;
     let obs_source_properties = obs_source_properties()?;
@@ -239,6 +239,10 @@ pub fn enumerate_list_property_diag(
     let mut found = false;
     let mut raw = 0usize;
     let mut fmt = 0i32;
+    // Set when a value could only be read as an integer. Reported to the
+    // caller so it can restore the number without having to guess from the
+    // digits: a device id that merely looks numeric must stay a string.
+    let mut used_int = false;
     let props = obs_source_properties(source);
     if !props.is_null() {
         let prop = obs_properties_get(props, prop_key.as_ptr());
@@ -264,7 +268,12 @@ pub fn enumerate_list_property_diag(
                 };
                 let value = if value.is_empty() {
                     let n = item_int(prop, i);
-                    if n == 0 { String::new() } else { n.to_string() }
+                    if n == 0 {
+                        String::new()
+                    } else {
+                        used_int = true;
+                        n.to_string()
+                    }
                 } else {
                     value
                 };
@@ -279,7 +288,7 @@ pub fn enumerate_list_property_diag(
     // point being impossible by construction: nothing between the create
     // and here can return early.
     obs_source_release(source);
-    Some((out, found, raw, fmt))
+    Some((out, found, raw, fmt, used_int))
 }
 
 // `libobs/obs.h`: the pair a projector window uses to say "render this

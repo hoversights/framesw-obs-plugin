@@ -755,6 +755,7 @@ struct ListDevices {
     found_property: bool,
     raw_count: usize,
     list_format: i32,
+    values_are_ints: bool,
     error: Option<String>,
 }
 
@@ -785,11 +786,12 @@ extern "C" fn list_devices_on_ui_thread(param: *mut c_void) {
         };
 
         match enumerate_list_property_diag(&state.kind, &state.property, settings) {
-            Some((devices, found, raw, fmt)) => {
+            Some((devices, found, raw, fmt, used_int)) => {
                 state.devices = Some(devices);
                 state.found_property = found;
                 state.raw_count = raw;
                 state.list_format = fmt;
+                state.values_are_ints = used_int;
             }
             None => state.devices = None,
         }
@@ -858,6 +860,7 @@ fn handle_list_devices_impl(
         found_property: false,
         raw_count: 0,
         list_format: 0,
+        values_are_ints: false,
         error: None,
     };
     obs_queue_task(
@@ -881,6 +884,7 @@ fn handle_list_devices_impl(
             obs_data::set_bool(response_data, "found_property", state.found_property);
             obs_data::set_int(response_data, "raw_count", state.raw_count as i64);
             obs_data::set_int(response_data, "list_format", state.list_format as i64);
+            obs_data::set_bool(response_data, "values_are_ints", state.values_are_ints);
             if obs_data::set_pair_array(response_data, "devices", "value", &items) {
                 obs_data::set_bool(response_data, "ok", true);
             } else {
