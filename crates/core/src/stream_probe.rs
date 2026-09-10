@@ -271,6 +271,20 @@ pub fn quality() -> Option<Quality> {
 /// What the stream is CONFIGURED to send — the thing obs-websocket
 /// cannot answer in Advanced mode. Returns `(video_kbps, audio_kbps,
 /// encoder_id)`, each optional.
+///
+/// ONLY WHILE STREAMING, and this is a property of OBS rather than a
+/// shortcoming here: OBS creates the `simple_stream`/`adv_stream` output
+/// when streaming starts and destroys it when it stops, so before a show
+/// there is no output to ask and every field comes back `None`.
+/// Verified live — a call with nothing streaming returns
+/// `configured_video_kbps: 0`.
+///
+/// That is the opposite of when preflight wants it, so the loop is
+/// closed the other way round: FrameSW records the bitrate into its
+/// session history on the falling edge of streaming, and the NEXT
+/// preflight warns from that record. Reading it cold would mean parsing
+/// the profile's streamEncoder.json, which is worth doing only if the
+/// recorded-from-last-show route proves insufficient.
 pub fn configured() -> (Option<i64>, Option<i64>, Option<String>) {
     let out = stream_output();
     if out.is_null() {
