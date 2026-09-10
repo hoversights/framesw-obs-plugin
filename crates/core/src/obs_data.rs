@@ -49,6 +49,11 @@ crate::resolved_fn!(obs_data_array_push_back: extern "C" fn(*mut ObsDataArrayT, 
 // `libobs/obs-data.h`: "Gets string, defaults to "" if it does not exist
 // or is not a string."  Signature: `const char *obs_data_get_string(obs_data_t *data, const char *name);`
 crate::resolved_fn!(obs_data_get_string: extern "C" fn(*mut ObsDataT, *const c_char) -> *const c_char);
+// `libobs/obs-data.h`: `long long obs_data_get_int(obs_data_t *data,
+// const char *name)`. Added for `stream_probe`, which reads an encoder's
+// configured bitrate straight out of its settings -- the one figure
+// obs-websocket cannot supply in Advanced mode.
+crate::resolved_fn!(obs_data_get_int: extern "C" fn(*mut ObsDataT, *const c_char) -> i64);
 
 fn cstr(s: &str) -> CString {
     CString::new(s).unwrap_or_else(|e| {

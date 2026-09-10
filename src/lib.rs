@@ -1699,6 +1699,79 @@ fn handle_resume_rescan_impl(
     obs_data::set_bool(response_data, "ok", true);
 }
 
+extern "C" fn handle_stream_quality(
+    request_data: *mut c_void,
+    response_data: *mut c_void,
+    priv_data: *mut c_void,
+) {
+    ffi_guard(
+        "handle_stream_quality",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            handle_stream_quality_impl(request_data, response_data, priv_data)
+        }),
+    );
+}
+
+/// Request: `{}`. Response: `{"ok": true, "sampled": bool, ...}`.
+///
+/// Two things FrameSW cannot get any other way.
+///
+/// The QUALITY figures come from 10 Hz sampling inside the plugin. A
+/// stream that alternates 250ms of full-rate sending with 250ms of
+/// nothing has the same 2-second average as a steady one; the average
+/// says healthy and the viewer sees it buffer. Jitter, stall count and
+/// peak-versus-mean congestion are destroyed by averaging, so they have
+/// to be measured before it happens — see `stream_probe`'s module doc.
+///
+/// The CONFIGURED bitrate is here because obs-websocket exposes no
+/// request for it in Advanced mode, where it lives in the profile's
+/// streamEncoder.json rather than basic.ini. libobs hands it over for
+/// either mode and any encoder.
+///
+/// `sampled` is `false` rather than absent when nothing is streaming or
+/// the window is too short: "not measured" and "measured as zero" are
+/// different facts and the caller must be able to tell them apart.
+fn handle_stream_quality_impl(
+    _request_data: *mut c_void,
+    response_data: *mut c_void,
+    _priv_data: *mut c_void,
+) {
+    let response_data = obs_data::from_void(response_data);
+    obs_data::set_bool(response_data, "ok", true);
+
+    let (video_kbps, audio_kbps, encoder) = studio_mode_meters_core::stream_probe::configured();
+    obs_data::set_int(response_data, "configured_video_kbps", video_kbps.unwrap_or(0));
+    obs_data::set_int(response_data, "configured_audio_kbps", audio_kbps.unwrap_or(0));
+    obs_data::set_string(response_data, "encoder", &encoder.unwrap_or_default());
+
+    match studio_mode_meters_core::stream_probe::quality() {
+        Some(q) => {
+            obs_data::set_bool(response_data, "sampled", true);
+            obs_data::set_int(response_data, "kbps_mean", q.kbps_mean as i64);
+            // Scaled to an integer because this plugin's calldata helpers
+            // deliberately carry no double setter — see obs_data.rs.
+            obs_data::set_int(response_data, "jitter_pct", (q.jitter * 100.0) as i64);
+            obs_data::set_int(response_data, "stalls", i64::from(q.stalls));
+            obs_data::set_int(response_data, "buckets", i64::from(q.buckets));
+            obs_data::set_int(
+                response_data,
+                "congestion_peak_pct",
+                (q.congestion_peak * 100.0) as i64,
+            );
+            obs_data::set_int(
+                response_data,
+                "congestion_mean_pct",
+                (q.congestion_mean * 100.0) as i64,
+            );
+            obs_data::set_int(response_data, "dropped_delta", i64::from(q.dropped_delta));
+            obs_data::set_int(response_data, "total_delta", i64::from(q.total_delta));
+            obs_data::set_int(response_data, "score", i64::from(q.score()));
+        }
+        None => obs_data::set_bool(response_data, "sampled", false),
+    }
+}
+
 extern "C" fn handle_tap_status(
     request_data: *mut c_void,
     response_data: *mut c_void,
@@ -1967,6 +2040,7 @@ pub extern "C" fn obs_module_post_load() {
             ("set_mix_sources", handle_set_mix_sources as calldata::RequestCallbackFn),
             ("stop_mix_bus", handle_stop_mix_bus as calldata::RequestCallbackFn),
             ("mix_status", handle_mix_status as calldata::RequestCallbackFn),
+            ("stream_quality", handle_stream_quality as calldata::RequestCallbackFn),
         ] {
             if calldata::register_request(vendor, request_type, callback) {
                 log_line(&format!("registered vendor request \"{request_type}\""));
@@ -1974,6 +2048,13 @@ pub extern "C" fn obs_module_post_load() {
                 log_line(&format!("failed to register vendor request \"{request_type}\""));
             }
         }
+        // Sampling the stream output at 10 Hz. Started here rather than
+        // on demand so the window is already full when FrameSW first
+        // asks -- a probe that begins when the question is asked has
+        // nothing to answer with for its first two seconds, which is
+        // exactly when an operator is looking.
+        studio_mode_meters_core::stream_probe::start();
+        log_line("stream probe started (10 Hz)");
     })
 }
 
@@ -1990,6 +2071,10 @@ pub extern "C" fn obs_module_post_load() {
 pub extern "C" fn obs_module_unload() {
     ffi_guard("obs_module_unload", (), || {
         studio_mode_meters_core::metering::shutdown();
+        // Same rule as the metering thread above: a detached thread that
+        // keeps calling into libobs after OBS starts tearing down core
+        // state is the 2026-07-15 segfault, not a theoretical risk.
+        studio_mode_meters_core::stream_probe::shutdown();
         // No active monitor tap's NDI sender should outlive the plugin.
         audio_tap::stop_all();
         log_line("unloaded — background threads stopped cleanly");

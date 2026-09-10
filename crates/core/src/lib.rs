@@ -31,6 +31,7 @@ pub mod calldata;
 pub mod obs_data;
 pub mod metering;
 pub mod platform;
+pub mod stream_probe;
 
 use std::ffi::{c_char, c_int, CString};
 use std::sync::OnceLock;
