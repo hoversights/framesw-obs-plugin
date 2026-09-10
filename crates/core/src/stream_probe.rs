@@ -117,6 +117,9 @@ impl Quality {
 struct Probe {
     stop: Arc<AtomicBool>,
     window: Arc<Mutex<Vec<Tick>>>,
+    /// Kept so `shutdown` can JOIN, not merely ask. See its doc comment
+    /// — dropping this is what crashed OBS on quit.
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
@@ -152,11 +155,18 @@ pub fn start() {
     let stop = Arc::new(AtomicBool::new(false));
     let window: Arc<Mutex<Vec<Tick>>> = Arc::new(Mutex::new(Vec::new()));
     let (s, w) = (Arc::clone(&stop), Arc::clone(&window));
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("framesw-stream-probe".into())
         .spawn(move || {
             while !s.load(Ordering::Relaxed) {
                 std::thread::sleep(TICK);
+                // Re-checked AFTER the sleep, before touching libobs at
+                // all. The loop condition alone leaves a 100ms window in
+                // which shutdown is requested, the thread wakes, and calls
+                // into libobs anyway.
+                if s.load(Ordering::Relaxed) {
+                    return;
+                }
                 let out = stream_output();
                 if out.is_null() {
                     continue;
@@ -189,13 +199,43 @@ pub fn start() {
             }
         })
         .ok();
-    *guard = Some(Probe { stop, window });
+    *guard = Some(Probe { stop, window, handle });
 }
 
-/// Stops the sampler and waits for the thread to notice.
+/// Stops the sampler and BLOCKS until the thread has actually exited.
+///
+/// Joining is the whole point, and the first version did not — it set
+/// the flag and returned. OBS then carried on with teardown while this
+/// thread was still inside its 100ms sleep; it woke, called
+/// `obs_get_output_by_name`, and took a `pthread_mutex_lock` on libobs's
+/// output-list mutex after libobs had destroyed it. Segfault on quit,
+/// EXC_BAD_ACCESS at 0x578, caught by an operator's crash dialog on
+/// 2026-09-10.
+///
+/// `metering::shutdown` already did this correctly and this is the same
+/// hazard `obs_module_unload` exists for — the 2026-07-15 segfault in
+/// `obs_enum_sources` was the identical shape. Asking a detached thread
+/// to stop is not the same as knowing it has.
+///
+/// Costs at most one loop iteration, ~100ms.
 pub fn shutdown() {
-    if let Some(p) = PROBE.lock().unwrap().take() {
-        p.stop.store(true, Ordering::Relaxed);
+    let handle = {
+        let mut guard = match PROBE.lock() {
+            Ok(g) => g,
+            // Poisoned means the sampler panicked. Nothing to join, and
+            // refusing to shut down would be worse than proceeding.
+            Err(e) => e.into_inner(),
+        };
+        match guard.take() {
+            Some(mut p) => {
+                p.stop.store(true, Ordering::Relaxed);
+                p.handle.take()
+            }
+            None => None,
+        }
+    };
+    if let Some(h) = handle {
+        let _ = h.join();
     }
 }
 
