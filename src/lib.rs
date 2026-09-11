@@ -2003,6 +2003,88 @@ pub extern "C" fn obs_module_load() -> bool {
     })
 }
 
+
+// ---- Tools > Show FrameSW --------------------------------------------
+//
+// The return half of FrameSW's "Show OBS" button. FrameSW cannot host a
+// "back to FrameSW" control, because at the moment you need it FrameSW is
+// precisely the window you cannot see — so the control has to live inside
+// OBS, and only something running inside OBS can put it there.
+//
+// `obs_frontend_add_tools_menu_item` is plain C — a `const char *` and a C
+// callback — which is the whole reason this fits the plugin at all.
+// Hiding OBS's main *window* was the obvious first idea and would have
+// meant calling C++ methods on a `QMainWindow *` (or Objective-C on its
+// NSWindow) from Rust, inside a live-streaming process. Adding a menu item
+// needs neither.
+//
+// `obs-frontend-api/obs-frontend-api.h`:
+//   typedef void (*obs_frontend_cb)(void *private_data);
+//   void obs_frontend_add_tools_menu_item(const char *name,
+//                                         obs_frontend_cb callback,
+//                                         void *private_data);
+type ObsFrontendCb = extern "C" fn(*mut c_void);
+studio_mode_meters_core::resolved_fn!(
+    obs_frontend_add_tools_menu_item:
+        extern "C" fn(*const c_char, ObsFrontendCb, *mut c_void)
+);
+
+/// Brings FrameSW's window to the front — the mirror of FrameSW's own
+/// `platform::activate_obs`, deliberately using the same mechanism in each
+/// direction so the two halves of the toggle behave alike.
+fn raise_framesw() {
+    #[cfg(target_os = "macos")]
+    {
+        // By bundle id rather than app name: survives the app being
+        // renamed or installed outside /Applications.
+        let _ = std::process::Command::new("open")
+            .args(["-b", "com.hoversights.obscontroller"])
+            .spawn();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: without it this flashes a console window on
+        // every click, in front of the very app we are raising.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // AppActivate matches a window-title substring, which for
+        // FrameSW's main window always contains "FrameSW". The click that
+        // ran this callback gave OBS foreground rights, so Windows permits
+        // handing the foreground on.
+        let _ = std::process::Command::new("powershell")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "-NoProfile",
+                "-Command",
+                "(New-Object -ComObject WScript.Shell).AppActivate('FrameSW')",
+            ])
+            .spawn();
+    }
+}
+
+/// Tools-menu callback. Wrapped like every other entry point handed to OBS
+/// (invariant 1): a Rust panic unwinding into OBS's C frames is undefined
+/// behavior in a user's live-streaming process.
+extern "C" fn show_framesw_menu_clicked(_private_data: *mut c_void) {
+    ffi_guard("show_framesw_menu_clicked", (), || {
+        raise_framesw();
+    })
+}
+
+/// Adds the Tools-menu item, if the host exposes the frontend API. A
+/// missing symbol degrades to "no menu item" and touches nothing else,
+/// per this plugin's never-unwrap-a-resolved-function rule.
+fn add_show_framesw_menu_item() {
+    let Some(add_item) = obs_frontend_add_tools_menu_item() else {
+        log_line("obs_frontend_add_tools_menu_item unavailable — no Tools > Show FrameSW item");
+        return;
+    };
+    let Ok(name) = CString::new("Show FrameSW") else {
+        return;
+    };
+    add_item(name.as_ptr(), show_framesw_menu_clicked, std::ptr::null_mut());
+    log_line("added Tools > Show FrameSW");
+}
 /// Called once, after every module (including obs-websocket, if
 /// installed) has finished `obs_module_load` — the obs-websocket header's
 /// own documented requirement for vendor registration, guaranteeing no
@@ -2011,6 +2093,12 @@ pub extern "C" fn obs_module_load() -> bool {
 #[no_mangle]
 pub extern "C" fn obs_module_post_load() {
     ffi_guard("obs_module_post_load", (), || {
+        // Registered ahead of the obs-websocket vendor check below,
+        // which returns early when obs-websocket is missing. This menu
+        // item is independent of the vendor channel — and an operator
+        // whose FrameSW is stuck behind OBS needs the way back whether
+        // or not the audio plumbing came up.
+        add_show_framesw_menu_item();
         let vendor = calldata::register_vendor(studio_mode_meters_core::identity().vendor);
         if vendor.is_null() {
             log_line("obs-websocket not installed/loaded — audio levels will only reach OBS's own log, not FrameSW");
