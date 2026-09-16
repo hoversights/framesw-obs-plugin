@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Sampling the live stream output faster than a websocket poll can.
 //!
 //! FrameSW polls obs-websocket every 2 seconds. That is enough to answer

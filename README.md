@@ -229,6 +229,17 @@ than left for a reviewer to work out.
 macOS builds and all cross-platform logic use only the Rust standard
 library and raw FFI — no third-party crates at all.
 
+### NDI
+
+The monitor-audio tap sends over NDI. This repository contains no NDI SDK
+code and redistributes no NDI runtime: `ndi_ffi.rs` resolves a handful of
+`NDIlib_*` symbols at runtime from whatever NDI Runtime is already
+installed on the machine (FrameSW bundles one; a system install works
+too), exactly as it does for libobs.
+
+NDI® is a registered trademark of Vizrt NDI AB — see
+[ndi.video](https://ndi.video/).
+
 **No OBS source is vendored or redistributed here.** Every libobs and
 obs-websocket symbol is resolved at runtime against whatever OBS already
 has loaded (`dlsym` on macOS, `GetProcAddress` plus module enumeration on
