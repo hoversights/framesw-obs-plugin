@@ -52,6 +52,7 @@ use std::sync::atomic::Ordering;
 
 mod audio_tap;
 mod ndi_ffi;
+mod shm_ring;
 mod video_tap;
 
 // `calldata`, `obs_data` and `platform` now live in the shared core crate

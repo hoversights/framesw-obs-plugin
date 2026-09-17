@@ -198,6 +198,26 @@ enum Which {
     Program,
 }
 
+/// How frames leave this plugin. NDI stays only until the shared-memory
+/// path has been measured against it on both platforms (Phase 0's numbers
+/// are the baseline), then it goes - two transports is not a feature.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Transport {
+    /// A memory-mapped ring FrameSW reads directly (`shm_ring.rs`).
+    Shm,
+    /// The Phase 0 spike's NDI sender, kept for comparison.
+    Ndi,
+}
+
+impl Transport {
+    fn label(self) -> &'static str {
+        match self {
+            Transport::Shm => "shm",
+            Transport::Ndi => "ndi",
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Path {
     /// Own `obs_view` + `obs_view_add2` mix + our output: GPU render/scale.
@@ -240,6 +260,12 @@ struct Stats {
 /// Everything the OBS video callback and the send worker share.
 struct Shared {
     name: String,
+    transport: Transport,
+    /// Written directly from OBS's video callback when the transport is
+    /// `Shm`: the copy into the ring IS the delivery, so there is no worker
+    /// thread and no second copy. Only teardown ever contends this lock, and
+    /// only after the callback has been disconnected.
+    ring: Mutex<Option<crate::shm_ring::RingWriter>>,
     width: u32,
     height: u32,
     fps_num: u32,
@@ -330,6 +356,21 @@ fn copy_frame(shared: &Shared, frame: *mut VideoData) {
         return;
     }
     let started = Instant::now();
+    if shared.transport == Transport::Shm {
+        // Straight into the ring, on this thread: a memcpy of 345 KB at
+        // 640x360, no encode, nothing to wake.
+        if let Some(ring) = lock(&shared.ring).as_mut() {
+            // SAFETY: libobs's own planes, valid for this call, and the
+            // strides are the ones it just reported.
+            unsafe {
+                ring.write_frame(frame.data[0], y_stride, frame.data[1], uv_stride, now_100ns() as u64);
+            }
+            shared.stats.frames_in.fetch_add(1, Ordering::Relaxed);
+            shared.stats.frames_sent.fetch_add(1, Ordering::Relaxed);
+            shared.stats.copy_ns.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        return;
+    }
     let y_len = w * h;
     let mut buf = lock(&shared.slot).spare.pop().unwrap_or_default();
     buf.resize(y_len + w * (h / 2), 0);
@@ -368,7 +409,7 @@ extern "C" fn on_raw_video_frame(param: *mut c_void, frame: *mut VideoData) {
     );
 }
 
-fn worker_loop(shared: Arc<Shared>, sender: NdiVideoSender) {
+fn worker_loop(shared: Arc<Shared>, sender: Option<NdiVideoSender>) {
     let mut last_log = Instant::now();
     let mut logged = [0u64; 5];
     loop {
@@ -386,7 +427,7 @@ fn worker_loop(shared: Arc<Shared>, sender: NdiVideoSender) {
         if !shared.running.load(Ordering::Relaxed) {
             break;
         }
-        if let Some(mut frame) = frame {
+        if let (Some(mut frame), Some(sender)) = (frame, sender.as_ref()) {
             let started = Instant::now();
             sender.send_nv12(shared.width, shared.height, shared.fps_num, shared.fps_den, &mut frame.data, frame.timecode);
             let ns = started.elapsed().as_nanos() as u64;
@@ -551,9 +592,19 @@ pub fn register_output_type() {
 struct Request {
     preview: bool,
     program: bool,
+    transport: Transport,
     width: u32,
     height: u32,
     program_path: Path,
+}
+
+/// Filename half of a feed's ring (`shm_ring::ring_path`). Short and
+/// stable: FrameSW builds the same path from the same key.
+fn feed_key(which: Which) -> &'static str {
+    match which {
+        Which::Preview => "preview",
+        Which::Program => "program",
+    }
 }
 
 fn ndi_name(which: Which) -> &'static str {
@@ -598,16 +649,37 @@ fn wanted_source(which: Which) -> *mut ObsSourceT {
     }
 }
 
-fn start_feed(which: Which, path: Path, width: u32, height: u32) -> Result<Feed, String> {
-    // Fail on NDI before touching OBS's render loop.
-    let sender = NdiVideoSender::new(ndi_name(which))?;
+fn start_feed(
+    which: Which,
+    path: Path,
+    transport: Transport,
+    width: u32,
+    height: u32,
+) -> Result<Feed, String> {
     let ovi = main_ovi()?;
+    let fps_num = ovi.fps_num.max(1);
+    let fps_den = ovi.fps_den.max(1);
+    // Whichever transport it is, fail on it BEFORE touching OBS's render
+    // loop: a half-attached feed is the state worth never reaching.
+    let (sender, ring) = match transport {
+        Transport::Shm => (
+            None,
+            Some(crate::shm_ring::RingWriter::create(feed_key(which), width, height, fps_num, fps_den)?),
+        ),
+        Transport::Ndi => (Some(NdiVideoSender::new(ndi_name(which))?), None),
+    };
+    let ring_path = ring
+        .as_ref()
+        .map(|r| r.path().display().to_string())
+        .unwrap_or_default();
     let shared = Arc::new(Shared {
         name: ndi_name(which).to_string(),
+        transport,
+        ring: Mutex::new(ring),
         width,
         height,
-        fps_num: ovi.fps_num.max(1),
-        fps_den: ovi.fps_den.max(1),
+        fps_num,
+        fps_den,
         running: AtomicBool::new(true),
         slot: Mutex::new(Slot::default()),
         ready: Condvar::new(),
@@ -615,6 +687,8 @@ fn start_feed(which: Which, path: Path, width: u32, height: u32) -> Result<Feed,
         source_name: Mutex::new(String::new()),
     });
     let worker_shared = Arc::clone(&shared);
+    // The worker sends NDI frames; with the ring there is nothing to send,
+    // so it only reports the 10-second counters.
     let worker = std::thread::Builder::new()
         .name(format!("framesw-video-{}", path.label()))
         .spawn(move || worker_loop(worker_shared, sender))
@@ -631,9 +705,11 @@ fn start_feed(which: Which, path: Path, width: u32, height: u32) -> Result<Feed,
     match attach(&mut feed) {
         Ok(()) => {
             log_line(&format!(
-                "video feed '{}' started ({} path, source '{}')",
+                "video feed '{}' started ({} path, {} transport{}, source '{}')",
                 feed.shared.name,
                 path.label(),
+                transport.label(),
+                if ring_path.is_empty() { String::new() } else { format!(" at {ring_path}") },
                 lock(&feed.shared.source_name)
             ));
             Ok(feed)
@@ -773,10 +849,21 @@ fn teardown(mut feed: Feed) {
     ));
 }
 
-fn reconcile(slot: &mut Option<Feed>, which: Which, want: bool, path: Path, width: u32, height: u32) -> Result<(), String> {
-    let matches = slot
-        .as_ref()
-        .is_some_and(|f| f.path == path && f.shared.width == width && f.shared.height == height);
+fn reconcile(
+    slot: &mut Option<Feed>,
+    which: Which,
+    want: bool,
+    path: Path,
+    transport: Transport,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    let matches = slot.as_ref().is_some_and(|f| {
+        f.path == path
+            && f.shared.transport == transport
+            && f.shared.width == width
+            && f.shared.height == height
+    });
     if want && matches {
         return Ok(());
     }
@@ -784,7 +871,7 @@ fn reconcile(slot: &mut Option<Feed>, which: Which, want: bool, path: Path, widt
         teardown(old);
     }
     if want {
-        *slot = Some(start_feed(which, path, width, height)?);
+        *slot = Some(start_feed(which, path, transport, width, height)?);
     }
     Ok(())
 }
@@ -794,8 +881,24 @@ fn apply(req: Request) -> Result<(), String> {
         return Err("OBS is exiting".into());
     }
     let mut feeds = lock(&FEEDS);
-    let preview = reconcile(&mut feeds.preview, Which::Preview, req.preview, Path::View, req.width, req.height);
-    let program = reconcile(&mut feeds.program, Which::Program, req.program, req.program_path, req.width, req.height);
+    let preview = reconcile(
+        &mut feeds.preview,
+        Which::Preview,
+        req.preview,
+        Path::View,
+        req.transport,
+        req.width,
+        req.height,
+    );
+    let program = reconcile(
+        &mut feeds.program,
+        Which::Program,
+        req.program,
+        req.program_path,
+        req.transport,
+        req.width,
+        req.height,
+    );
     let any = feeds.preview.is_some() || feeds.program.is_some();
     drop(feeds);
     if any {
@@ -948,6 +1051,15 @@ fn write_status(response: *mut ObsDataT) {
         obs_data::set_bool(response, &format!("{key}_active"), true);
         obs_data::set_string(response, &format!("{key}_ndi_name"), &feed.shared.name);
         obs_data::set_string(response, &format!("{key}_path"), feed.path.label());
+        obs_data::set_string(response, &format!("{key}_transport"), feed.shared.transport.label());
+        obs_data::set_string(
+            response,
+            &format!("{key}_ring"),
+            &lock(&feed.shared.ring)
+                .as_ref()
+                .map(|r| r.path().display().to_string())
+                .unwrap_or_default(),
+        );
         obs_data::set_string(response, &format!("{key}_source"), &lock(&feed.shared.source_name));
         obs_data::set_int(response, &format!("{key}_width"), feed.shared.width as i64);
         obs_data::set_int(response, &format!("{key}_height"), feed.shared.height as i64);
@@ -983,6 +1095,12 @@ pub extern "C" fn handle_start_video_feed(request_data: *mut c_void, response_da
                 program_path: match obs_data::get_string(request, "program_path").as_deref() {
                     Some("view") => Path::View,
                     _ => Path::Raw,
+                },
+                // Shared memory unless something explicitly asks for the old
+                // NDI path, which exists only for comparison now.
+                transport: match obs_data::get_string(request, "transport").as_deref() {
+                    Some("ndi") => Transport::Ndi,
+                    _ => Transport::Shm,
                 },
             };
             match run_on_ui(Some(req)) {
