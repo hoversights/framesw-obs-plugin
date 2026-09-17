@@ -52,6 +52,8 @@ use std::sync::atomic::Ordering;
 
 mod audio_tap;
 mod ndi_ffi;
+mod shm_ring;
+mod video_tap;
 
 // `calldata`, `obs_data` and `platform` now live in the shared core crate
 // so the community metering plugin builds on the same copy of this
@@ -1997,6 +1999,8 @@ pub extern "C" fn obs_module_load() -> bool {
         // regression with no error anywhere, caught only because the
         // compiler noticed `forward_if_tapped` had become unreachable.
         studio_mode_meters_core::metering::set_audio_sink(audio_tap::forward_if_tapped);
+        // Output types can only be registered during obs_module_load.
+        video_tap::register_output_type();
         log_line("loaded — watching for audio on Preview-only sources");
         spawn_periodic_rescan();
         true
@@ -2129,6 +2133,9 @@ pub extern "C" fn obs_module_post_load() {
             ("stop_mix_bus", handle_stop_mix_bus as calldata::RequestCallbackFn),
             ("mix_status", handle_mix_status as calldata::RequestCallbackFn),
             ("stream_quality", handle_stream_quality as calldata::RequestCallbackFn),
+            ("start_video_feed", video_tap::handle_start_video_feed as calldata::RequestCallbackFn),
+            ("stop_video_feed", video_tap::handle_stop_video_feed as calldata::RequestCallbackFn),
+            ("video_feed_status", video_tap::handle_video_feed_status as calldata::RequestCallbackFn),
         ] {
             if calldata::register_request(vendor, request_type, callback) {
                 log_line(&format!("registered vendor request \"{request_type}\""));
@@ -2165,6 +2172,10 @@ pub extern "C" fn obs_module_unload() {
         studio_mode_meters_core::stream_probe::shutdown();
         // No active monitor tap's NDI sender should outlive the plugin.
         audio_tap::stop_all();
+        // Normally already stopped on OBS_FRONTEND_EVENT_EXIT; this covers
+        // an exit that never emitted it. Frontend callbacks are already
+        // gone by now, so this touches only libobs (video_tap.rs doc).
+        video_tap::stop_all();
         log_line("unloaded — background threads stopped cleanly");
     })
 }

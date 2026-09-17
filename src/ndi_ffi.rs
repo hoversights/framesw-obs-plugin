@@ -80,18 +80,54 @@ pub struct NdiAudioFrameV2 {
     pub timestamp: i64,
 }
 
+/// `Processing.NDI.structs.h`'s `NDIlib_video_frame_v2_t` — field
+/// order/types verbatim (NDI 6 SDK, `/Library/NDI SDK for Apple/include`,
+/// 2026-09-15). `FourCC` and `frame_format_type` are C enums, so `u32`/
+/// `i32`-sized; `line_stride_in_bytes` is the `int` arm of a union whose
+/// other arm (`data_size_in_bytes`) is also `int`. `timestamp` is
+/// receive-only per the header.
+#[repr(C)]
+pub struct NdiVideoFrameV2 {
+    pub xres: i32,
+    pub yres: i32,
+    pub fourcc: u32,
+    pub frame_rate_n: i32,
+    pub frame_rate_d: i32,
+    pub picture_aspect_ratio: f32,
+    pub frame_format_type: i32,
+    pub timecode: i64,
+    pub p_data: *mut u8,
+    pub line_stride_in_bytes: i32,
+    pub p_metadata: *const c_char,
+    pub timestamp: i64,
+}
+
+/// `NDI_LIB_FOURCC('N','V','1','2')` — "an 8bpp luminance buffer.
+/// Immediately following this is an interleaved buffer of 8bpp Cb, Cr
+/// pairs" (header comment). Same byte order as libobs's NV12.
+pub const NDI_FOURCC_NV12: u32 =
+    (b'N' as u32) | ((b'V' as u32) << 8) | ((b'1' as u32) << 16) | ((b'2' as u32) << 24);
+/// `NDIlib_frame_format_type_progressive = 1`.
+pub const NDI_FRAME_FORMAT_PROGRESSIVE: i32 = 1;
+
 type NdiInitializeFn = extern "C" fn() -> bool;
 type NdiSendCreateFn = extern "C" fn(*const NdiSendCreate) -> *mut NdiSendInstanceT;
 type NdiSendDestroyFn = extern "C" fn(*mut NdiSendInstanceT);
 type NdiSendSendAudioV2Fn = extern "C" fn(*mut NdiSendInstanceT, *const NdiAudioFrameV2);
+/// `Processing.NDI.Send.h`: `void NDIlib_send_send_video_v2(NDIlib_send_instance_t
+/// p_instance, const NDIlib_video_frame_v2_t* p_video_data);`
+type NdiSendSendVideoV2Fn = extern "C" fn(*mut NdiSendInstanceT, *const NdiVideoFrameV2);
 
-/// Only `send_create`/`send_destroy`/`send_send_audio_v2` are kept past
-/// load time — `NDIlib_initialize` is called exactly once, during
-/// `load_ndi` itself, and NDI's own docs don't require calling it again.
+/// Only the send functions are kept past load time — `NDIlib_initialize`
+/// is called exactly once, during `load_ndi` itself, and NDI's own docs
+/// don't require calling it again.
 struct NdiLib {
     send_create: NdiSendCreateFn,
     send_destroy: NdiSendDestroyFn,
     send_send_audio_v2: NdiSendSendAudioV2Fn,
+    /// Optional on purpose: resolving it with `?` like the audio symbols
+    /// would let a runtime without it switch off monitor audio too.
+    send_send_video_v2: Option<NdiSendSendVideoV2Fn>,
 }
 
 // SAFETY: every field is a plain `extern "C" fn` pointer into a shared
@@ -208,6 +244,8 @@ fn load_ndi() -> Option<NdiLib> {
             crate::platform::resolve_in_as(handle, "NDIlib_send_destroy")?;
         let send_send_audio_v2: NdiSendSendAudioV2Fn =
             crate::platform::resolve_in_as(handle, "NDIlib_send_send_audio_v2")?;
+        let send_send_video_v2: Option<NdiSendSendVideoV2Fn> =
+            crate::platform::resolve_in_as(handle, "NDIlib_send_send_video_v2");
         if !initialize() {
             // Real NDI failure mode (documented): the CPU doesn't meet
             // NDI's minimum instruction-set requirement (SSE4.2). Treat
@@ -215,7 +253,84 @@ fn load_ndi() -> Option<NdiLib> {
             // untouched.
             return None;
         }
-        Some(NdiLib { send_create, send_destroy, send_send_audio_v2 })
+        Some(NdiLib { send_create, send_destroy, send_send_audio_v2, send_send_video_v2 })
+    }
+}
+
+/// `NDIlib_send_create` with the given clocking. `Err` says why, in the
+/// same two cases `NdiSender::new` distinguishes.
+fn create_instance(name: &str, clock_video: bool, clock_audio: bool) -> Result<*mut NdiSendInstanceT, String> {
+    let lib = ndi().ok_or_else(|| "NDI runtime not loaded/initialized".to_string())?;
+    let cname =
+        CString::new(name).map_err(|_| format!("sender name '{name}' contains an embedded NUL"))?;
+    let create = NdiSendCreate {
+        p_ndi_name: cname.as_ptr(),
+        p_groups: std::ptr::null(),
+        clock_video,
+        clock_audio,
+    };
+    let instance = (lib.send_create)(&create);
+    drop(cname);
+    if instance.is_null() {
+        return Err(format!(
+            "NDIlib_send_create('{name}') returned null (runtime loaded fine — this is a \
+             real creation failure, e.g. a same-named sender not fully torn down yet)"
+        ));
+    }
+    Ok(instance)
+}
+
+/// One video-only NDI sender (`video_tap.rs`). Unclocked: OBS's own video
+/// thread paces the frames, and a clocked `send_video` would sleep inside
+/// the call to hold the rate.
+pub struct NdiVideoSender {
+    instance: *mut NdiSendInstanceT,
+}
+
+// SAFETY: driven only by its feed's single worker thread (`video_tap.rs`);
+// created and destroyed on whichever thread owns the feed.
+unsafe impl Send for NdiVideoSender {}
+
+impl NdiVideoSender {
+    pub fn new(name: &str) -> Result<Self, String> {
+        let lib = ndi().ok_or_else(|| "NDI runtime not loaded/initialized".to_string())?;
+        if lib.send_send_video_v2.is_none() {
+            return Err("NDI runtime has no NDIlib_send_send_video_v2".to_string());
+        }
+        Ok(NdiVideoSender { instance: create_instance(name, false, false)? })
+    }
+
+    /// Sends one NV12 frame: `data` is the Y plane (`width` bytes per row)
+    /// immediately followed by the interleaved CbCr plane, no row padding.
+    /// `timecode` is 100 ns units; the spike stamps the capture wall-clock
+    /// time into it so a receiver can measure capture-to-display latency.
+    pub fn send_nv12(&self, width: u32, height: u32, fps_n: u32, fps_d: u32, data: &mut [u8], timecode: i64) {
+        let Some(send) = ndi().and_then(|lib| lib.send_send_video_v2) else {
+            return;
+        };
+        let frame = NdiVideoFrameV2 {
+            xres: width as i32,
+            yres: height as i32,
+            fourcc: NDI_FOURCC_NV12,
+            frame_rate_n: fps_n as i32,
+            frame_rate_d: fps_d as i32,
+            picture_aspect_ratio: width as f32 / height as f32,
+            frame_format_type: NDI_FRAME_FORMAT_PROGRESSIVE,
+            timecode,
+            p_data: data.as_mut_ptr(),
+            line_stride_in_bytes: width as i32,
+            p_metadata: std::ptr::null(),
+            timestamp: 0,
+        };
+        send(self.instance, &frame);
+    }
+}
+
+impl Drop for NdiVideoSender {
+    fn drop(&mut self) {
+        if let Some(lib) = ndi() {
+            (lib.send_destroy)(self.instance);
+        }
     }
 }
 

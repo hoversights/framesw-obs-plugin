@@ -41,6 +41,10 @@ version = "0.59"
 features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
+    # CreateFileMappingW/MapViewOfFile for the shared-memory video ring.
+    "Win32_System_Memory",
+    # CreateFileMappingW is gated on this too (it takes SECURITY_ATTRIBUTES).
+    "Win32_Security",
     "Win32_System_ProcessStatus",
     # Reading FrameSW's InstallLocation to find the NDI runtime it bundles.
     "Win32_System_Registry",

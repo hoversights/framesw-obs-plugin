@@ -152,6 +152,23 @@ pub fn build_levels_payload(levels: &[SourceLevel]) -> *mut ObsDataT {
 // it to false".
 crate::resolved_fn!(obs_data_get_bool: extern "C" fn(*mut ObsDataT, *const c_char) -> bool);
 crate::resolved_fn!(obs_data_has_user_value: extern "C" fn(*mut ObsDataT, *const c_char) -> bool);
+/// `Some(value)` only when the key is genuinely present, like
+/// `get_optional_bool`.
+pub fn get_optional_int(data: *mut ObsDataT, key: &str) -> Option<i64> {
+    let (Some(obs_data_get_int), Some(obs_data_has_user_value)) =
+        (self::obs_data_get_int(), self::obs_data_has_user_value())
+    else {
+        return None;
+    };
+    if data.is_null() {
+        return None;
+    }
+    let key = cstr(key);
+    if !obs_data_has_user_value(data, key.as_ptr()) {
+        return None;
+    }
+    Some(obs_data_get_int(data, key.as_ptr()))
+}
 
 /// `Some(value)` only when the key is genuinely present; `None` for
 /// absent, so callers can distinguish "not supplied" from `false`.
