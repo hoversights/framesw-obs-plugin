@@ -393,24 +393,63 @@ fn drain_and_sum(queues: &mut HashMap<String, Vec<VecDeque<f32>>>, channels: usi
             }
         }
     }
-    // Headroom: divide by how many sources actually contributed *this
-    // cycle*, not a fixed constant — two normal, near-unity sources
-    // summed raw easily doubles peak amplitude, which is exactly what
-    // live-reported "distorted" audio sounded like (harsh clipping, a
-    // different bug from the drift one above — both happened to share
-    // the word "distorted" in separate live reports). A single
-    // contributor plays at its own unattenuated level (nothing to clash
-    // with); each of N contributors effectively drops to 1/N so the sum
-    // can't exceed unity as long as no individual source already does.
-    // The final `clamp` is defense in depth for the case where one does
-    // (upstream gain/filters pushing a source past 0dBFS on its own) —
-    // never let a monitor-only mix send a value NDI/the receiving device
-    // would have to clip unpredictably.
-    let gain = 1.0 / contributor_count as f32;
+    // A sum is a sum. Each source arrives here already scaled by its own
+    // fader (`build_scaled_planar_buffer`, fed `obs_source_get_volume`),
+    // so levelling different inputs against each other is already done,
+    // one step earlier, by the operator. Anything this function does to
+    // the total undoes that.
+    //
+    // This used to divide by the contributor count for headroom. It did
+    // stop two near-unity sources clipping, but at a price nobody had
+    // measured: soloing a layer out of a two-source mix made it exactly
+    // 6dB louder, and staging a second audio shot dropped everything
+    // already playing by the same 6dB. Operator, 2026-09-18 — "when I
+    // click solo the volume of that solo channel slightly increases...
+    // the mix volume we create and the solo are not staying the same."
+    // A monitor bus that rides its own gain as shots come and go makes
+    // every fader position a lie.
+    //
+    // Clipping is handled where it belongs instead: on the way out, by
+    // `soft_clip`, which leaves normal levels untouched.
     for sample in &mut mixed {
-        *sample = (*sample * gain).clamp(-1.0, 1.0);
+        *sample = soft_clip(*sample);
     }
     Some(mixed)
+}
+
+/// Where the mix stops being linear, as a linear sample magnitude —
+/// about -0.9dBFS. Below this the signal passes through bit-exact, so
+/// ordinary material is never coloured; above it, the last sliver of
+/// headroom is compressed asymptotically toward 1.0.
+///
+/// Deliberately high. A first cut at 0.7 (-3dBFS) shaped levels that are
+/// completely normal for a monitor mix — 0.8 came back as 0.796 — which
+/// is colouring the operator's audio to solve a problem they do not have.
+/// Only a sum that is genuinely at the ceiling should be touched at all.
+const SOFT_CLIP_KNEE: f32 = 0.9;
+
+/// Bounds a sample to (-1, 1) without the squared-off edge of a hard
+/// `clamp`.
+///
+/// Hard clamping is what a monitor mix should never do: it turns a
+/// moment of overload into harmonic distortion that sounds like a broken
+/// source rather than a hot one, and it did so silently because the
+/// clamp only engaged on the peaks. `tanh` past the knee approaches
+/// unity smoothly and is C1-continuous there (its derivative at 0 is 1,
+/// matching the linear region), so there is no discontinuity to hear as
+/// the signal crosses the threshold.
+///
+/// Stateless on purpose — this is a shaper, not a compressor. No
+/// attack/release means no pumping, nothing to tune, and identical
+/// output for identical input, which is what makes it testable.
+fn soft_clip(sample: f32) -> f32 {
+    let magnitude = sample.abs();
+    if magnitude <= SOFT_CLIP_KNEE {
+        return sample;
+    }
+    let range = 1.0 - SOFT_CLIP_KNEE;
+    let shaped = SOFT_CLIP_KNEE + range * ((magnitude - SOFT_CLIP_KNEE) / range).tanh();
+    shaped.copysign(sample)
 }
 
 /// Called from `lib.rs`'s existing `audio_capture_callback` — every
@@ -649,38 +688,94 @@ mod tests {
     }
 
     #[test]
-    fn drain_and_sum_adds_two_sources_then_applies_headroom() {
+    fn drain_and_sum_adds_two_sources_without_touching_their_level() {
         let mut queues = queues_from(&[
-            ("a", &[&[1.0f32, 0.5, -0.5]]),
+            ("a", &[&[0.5f32, 0.3, -0.3]]),
             ("b", &[&[0.2f32, 0.2, 0.2]]),
         ]);
         let mixed = drain_and_sum(&mut queues, 1).expect("two real contributors");
-        // Raw sum would be [1.2, 0.7, -0.3] — halved (two contributors)
-        // to leave headroom, the actual fix for live-reported distortion
-        // (two normal-level sources summed raw clipping hard).
-        assert_eq!(mixed, vec![0.6, 0.35, -0.15]);
+        // The plain sum, unscaled. Every contributor is already at the
+        // level its own fader set; the bus does not get a vote. Compared
+        // with a tolerance because f32 addition is not exact (-0.3 + 0.2
+        // lands on -0.10000001), and asserting bit equality here would be
+        // asserting IEEE-754 rather than the mixing rule.
+        let expected = [0.7f32, 0.5, -0.1];
+        assert_eq!(mixed.len(), expected.len());
+        for (got, want) in mixed.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-6, "{got} != {want}");
+        }
+    }
+
+    /// The operator-visible bug this replaced: with two sources in the
+    /// mix, the old `1.0 / contributor_count` made a soloed layer
+    /// exactly 6dB louder than the same layer inside the mix. Solo is a
+    /// one-member mix, so the two paths must agree sample for sample.
+    #[test]
+    fn soloing_a_layer_does_not_change_its_level() {
+        const SAMPLES: &[f32] = &[0.5, 0.3, -0.3];
+
+        let mut in_mix = queues_from(&[("a", &[SAMPLES]), ("b", &[&[0.2f32, 0.2, 0.2]])]);
+        let mixed = drain_and_sum(&mut in_mix, 1).expect("two contributors");
+
+        let mut soloed_queues = queues_from(&[("a", &[SAMPLES])]);
+        let soloed = drain_and_sum(&mut soloed_queues, 1).expect("one contributor");
+
+        // "a"'s own contribution is what it was: the mix is the solo plus
+        // the other source, not a scaled-down version of either.
+        let a_inside_the_mix: Vec<f32> =
+            mixed.iter().zip([0.2f32, 0.2, 0.2]).map(|(m, b)| m - b).collect();
+        assert_eq!(soloed, a_inside_the_mix);
     }
 
     #[test]
     fn drain_and_sum_single_contributor_plays_at_full_level() {
-        // No headroom penalty when there's nothing else to clash with —
-        // only N > 1 contributors should ever get attenuated.
         let mut queues = queues_from(&[("a", &[&[0.8f32, -0.8]])]);
         let mixed = drain_and_sum(&mut queues, 1).expect("one contributor");
         assert_eq!(mixed, vec![0.8, -0.8]);
     }
 
     #[test]
-    fn drain_and_sum_clamps_a_source_that_already_exceeds_unity_on_its_own() {
-        // Defense in depth: headroom alone only guarantees no clipping
-        // when every individual contributor is itself within [-1, 1] —
-        // upstream gain/filters could push one source past that on its
-        // own, and the final mix must never hand NDI/the output device
-        // something further out of range than a single hot source
-        // already was.
+    fn soft_clip_leaves_ordinary_levels_bit_exact() {
+        for sample in [0.0f32, 0.1, -0.25, 0.5, SOFT_CLIP_KNEE, -SOFT_CLIP_KNEE] {
+            assert_eq!(soft_clip(sample), sample, "{sample} should pass through");
+        }
+    }
+
+    #[test]
+    fn soft_clip_bounds_everything_without_a_hard_edge() {
+        // Bounded and symmetric everywhere, including the absurd inputs a
+        // runaway filter could produce.
+        for sample in [1.0f32, 1.5, 4.0, 100.0, f32::MAX] {
+            let out = soft_clip(sample);
+            assert!(out <= 1.0, "{sample} -> {out} must never exceed unity");
+            assert!(out > SOFT_CLIP_KNEE, "{sample} -> {out} must stay above the knee");
+            assert_eq!(soft_clip(-sample), -out, "must be symmetric");
+        }
+        // Unlike a hard clamp, a real overload above the knee is still
+        // distinguishable from a mild one rather than both flattening to
+        // the same value. Far enough out, f32's own `tanh` saturates at
+        // 1.0 and they do converge — that is float precision, not the
+        // shaper, and by then the mix is 6dB past full scale anyway.
+        assert!(soft_clip(1.05) > soft_clip(1.0), "must stay monotonic near the knee");
+        assert!(soft_clip(1.0) > soft_clip(0.95), "must stay monotonic near the knee");
+    }
+
+    #[test]
+    fn soft_clip_is_continuous_across_the_knee() {
+        // No step at the threshold — a discontinuity here would be
+        // audible as a click every time the signal crossed it.
+        let below = soft_clip(SOFT_CLIP_KNEE - 1e-4);
+        let above = soft_clip(SOFT_CLIP_KNEE + 1e-4);
+        assert!((above - below).abs() < 1e-3, "{below} -> {above} is a step");
+    }
+
+    #[test]
+    fn a_hot_source_is_shaped_rather_than_squared_off() {
         let mut queues = queues_from(&[("a", &[&[1.5f32, -1.5]])]);
         let mixed = drain_and_sum(&mut queues, 1).expect("one (hot) contributor");
-        assert_eq!(mixed, vec![1.0, -1.0]);
+        assert_eq!(mixed[0], soft_clip(1.5));
+        assert_eq!(mixed[1], -mixed[0]);
+        assert!(mixed[0] < 1.0 && mixed[0] > SOFT_CLIP_KNEE);
     }
 
     #[test]
@@ -692,25 +787,26 @@ mod tests {
         // contributor's remaining samples stay queued for the next
         // cycle rather than being dropped or fabricated.
         let mut queues = queues_from(&[
-            ("a", &[&[1.0f32, 1.0, 1.0, 1.0]]),
-            ("b", &[&[0.5f32, 0.5]]), // only 2 samples available right now
+            ("a", &[&[0.4f32, 0.4, 0.4, 0.4]]),
+            ("b", &[&[0.2f32, 0.2]]), // only 2 samples available right now
         ]);
         let mixed = drain_and_sum(&mut queues, 1).expect("still a real contributor");
-        // Only 2 frames this cycle (the shorter of the two) — raw sum
-        // [1.5, 1.5], halved for headroom (2 contributors).
-        assert_eq!(mixed, vec![0.75, 0.75]);
+        // Only 2 frames this cycle (the shorter of the two). Levels stay
+        // under the soft-clip knee on purpose — this test is about frame
+        // counts, and a shaped sum would make it assert two things at once.
+        assert_eq!(mixed, vec![0.6000000238418579, 0.6000000238418579]);
         // "a"'s remaining 2 samples are still queued, untouched, for
         // whenever "b" (or the next flush) catches up — never lost.
-        assert_eq!(queues["a"][0], VecDeque::from(vec![1.0, 1.0]));
+        assert_eq!(queues["a"][0], VecDeque::from(vec![0.4, 0.4]));
     }
 
     #[test]
     fn drain_and_sum_handles_multiple_channels_independently() {
-        let mut queues = queues_from(&[("a", &[&[1.0f32, 1.0], &[-1.0f32, -1.0]])]);
+        let mut queues = queues_from(&[("a", &[&[0.5f32, 0.5], &[-0.5f32, -0.5]])]);
         let mixed = drain_and_sum(&mut queues, 2).expect("one contributor, two channels");
-        // Planar layout: channel 0's frames, then channel 1's. One
-        // contributor, so no headroom attenuation.
-        assert_eq!(mixed, vec![1.0, 1.0, -1.0, -1.0]);
+        // Planar layout: channel 0's frames, then channel 1's. Under the
+        // soft-clip knee so this asserts layout only.
+        assert_eq!(mixed, vec![0.5, 0.5, -0.5, -0.5]);
     }
 
     #[test]
