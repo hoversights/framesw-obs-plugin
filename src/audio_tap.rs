@@ -186,6 +186,26 @@ pub fn stop_all() {
 /// are queued (see `drain_and_sum`), so there's nothing to drift against.
 const MIX_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
 
+/// How many consecutive empty flush cycles a contributor gets before the
+/// mix stops waiting for it — 20 cycles of `MIX_FLUSH_INTERVAL`, so about
+/// 100ms.
+///
+/// The mix deliberately syncs to its slowest contributor: it only ever
+/// consumes what *every* source can supply, so a source that is
+/// momentarily behind is waited for rather than padded with fabricated
+/// silence (that padding was the cause of live-reported distortion,
+/// 2026-07-24 — see `drain_and_sum`). Waiting forever is the failure mode
+/// on the other side of that: a media shot that finishes, is paused, or
+/// is otherwise stopped simply stops firing audio callbacks, its queue
+/// drains to empty, and with no bound the *entire* preview mix goes
+/// silent waiting for audio that is never coming.
+///
+/// 100ms is chosen against OBS's real callback cadence, roughly 21ms for
+/// 1024 frames at 48kHz: comfortably more than four normal callback
+/// periods, so ordinary jitter never trips it, and short enough that a
+/// clip ending cannot mute the operator's monitor for a noticeable time.
+const MIX_STALL_CYCLES: u32 = 20;
+
 struct MixBus {
     sender: NdiSender,
     /// source_name -> that source's per-channel FIFO queues of scaled
@@ -316,6 +336,11 @@ pub fn mix_bus_sources(bus_id: &str) -> Option<HashSet<String>> {
 
 fn spawn_mix_flush_thread(bus: Arc<MixBus>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
+        // How many consecutive flush cycles each source has had nothing
+        // to give. Lives with the thread rather than on `MixBus` because
+        // nothing outside this loop has any use for it, and passing it in
+        // keeps `drain_and_sum` a pure function of its arguments.
+        let mut stalled: HashMap<String, u32> = HashMap::new();
         while bus.running.load(Ordering::Acquire) {
             std::thread::sleep(MIX_FLUSH_INTERVAL);
             if !bus.running.load(Ordering::Acquire) {
@@ -330,7 +355,7 @@ fn spawn_mix_flush_thread(bus: Arc<MixBus>) -> std::thread::JoinHandle<()> {
                 let Ok(mut queues) = bus.queues.lock() else {
                     continue;
                 };
-                drain_and_sum(&mut queues, channels)
+                drain_and_sum(&mut queues, channels, &mut stalled)
             };
             let Some(mut mixed) = mixed else {
                 continue;
@@ -353,6 +378,12 @@ fn spawn_mix_flush_thread(bus: Arc<MixBus>) -> std::thread::JoinHandle<()> {
 /// the map has the right channel count to contribute, or the shortest
 /// available length is zero.
 ///
+/// Waiting for the slowest contributor is bounded: a source that has had
+/// nothing to give for `MIX_STALL_CYCLES` consecutive cycles stops being
+/// waited for, so a shot that ends or is paused can no longer take the
+/// whole mix silent with it. `stalled` carries that per-source count
+/// between calls and is owned by the flush thread.
+///
 /// Split out from the flush thread's own loop so this — the actual
 /// mixing arithmetic, and the fix for both the earlier "one layer plays
 /// clean, another stutters" bug and a later "even a single layer sounds
@@ -360,15 +391,38 @@ fn spawn_mix_flush_thread(bus: Arc<MixBus>) -> std::thread::JoinHandle<()> {
 /// against OBS's own real audio-callback timing, since
 /// `std::thread::sleep` is a minimum, not an exact clock) — is unit
 /// testable without a real thread, NDI sender, or bus registry.
-fn drain_and_sum(queues: &mut HashMap<String, Vec<VecDeque<f32>>>, channels: usize) -> Option<Vec<f32>> {
+fn drain_and_sum(
+    queues: &mut HashMap<String, Vec<VecDeque<f32>>>,
+    channels: usize,
+    stalled: &mut HashMap<String, u32>,
+) -> Option<Vec<f32>> {
+    // A source removed from the mix takes its stall count with it, so a
+    // name that later rejoins starts fresh rather than inheriting a
+    // verdict from a previous stint.
+    stalled.retain(|name, _| queues.contains_key(name));
+
     let mut frames = usize::MAX;
     let mut contributor_count = 0usize;
-    for per_channel in queues.values() {
+    for (name, per_channel) in queues.iter() {
         if per_channel.len() != channels {
             continue;
         }
-        contributor_count += 1;
         let available = per_channel.first().map_or(0, VecDeque::len);
+        if available == 0 {
+            // Empty this cycle. Wait for it — but not indefinitely.
+            let misses = stalled.entry(name.clone()).or_insert(0);
+            *misses = misses.saturating_add(1);
+            if *misses > MIX_STALL_CYCLES {
+                // Given up on: it contributes nothing and, crucially,
+                // holds nothing else back. It has no samples to sum
+                // anyway, so dropping it from the frame count is the
+                // whole of the change.
+                continue;
+            }
+        } else {
+            stalled.insert(name.clone(), 0);
+        }
+        contributor_count += 1;
         frames = frames.min(available);
     }
     if contributor_count == 0 || frames == 0 || frames == usize::MAX {
@@ -693,7 +747,7 @@ mod tests {
             ("a", &[&[0.5f32, 0.3, -0.3]]),
             ("b", &[&[0.2f32, 0.2, 0.2]]),
         ]);
-        let mixed = drain_and_sum(&mut queues, 1).expect("two real contributors");
+        let mixed = drain_and_sum(&mut queues, 1, &mut HashMap::new()).expect("two real contributors");
         // The plain sum, unscaled. Every contributor is already at the
         // level its own fader set; the bus does not get a vote. Compared
         // with a tolerance because f32 addition is not exact (-0.3 + 0.2
@@ -715,10 +769,10 @@ mod tests {
         const SAMPLES: &[f32] = &[0.5, 0.3, -0.3];
 
         let mut in_mix = queues_from(&[("a", &[SAMPLES]), ("b", &[&[0.2f32, 0.2, 0.2]])]);
-        let mixed = drain_and_sum(&mut in_mix, 1).expect("two contributors");
+        let mixed = drain_and_sum(&mut in_mix, 1, &mut HashMap::new()).expect("two contributors");
 
         let mut soloed_queues = queues_from(&[("a", &[SAMPLES])]);
-        let soloed = drain_and_sum(&mut soloed_queues, 1).expect("one contributor");
+        let soloed = drain_and_sum(&mut soloed_queues, 1, &mut HashMap::new()).expect("one contributor");
 
         // "a"'s own contribution is what it was: the mix is the solo plus
         // the other source, not a scaled-down version of either.
@@ -730,7 +784,7 @@ mod tests {
     #[test]
     fn drain_and_sum_single_contributor_plays_at_full_level() {
         let mut queues = queues_from(&[("a", &[&[0.8f32, -0.8]])]);
-        let mixed = drain_and_sum(&mut queues, 1).expect("one contributor");
+        let mixed = drain_and_sum(&mut queues, 1, &mut HashMap::new()).expect("one contributor");
         assert_eq!(mixed, vec![0.8, -0.8]);
     }
 
@@ -772,7 +826,7 @@ mod tests {
     #[test]
     fn a_hot_source_is_shaped_rather_than_squared_off() {
         let mut queues = queues_from(&[("a", &[&[1.5f32, -1.5]])]);
-        let mixed = drain_and_sum(&mut queues, 1).expect("one (hot) contributor");
+        let mixed = drain_and_sum(&mut queues, 1, &mut HashMap::new()).expect("one (hot) contributor");
         assert_eq!(mixed[0], soft_clip(1.5));
         assert_eq!(mixed[1], -mixed[0]);
         assert!(mixed[0] < 1.0 && mixed[0] > SOFT_CLIP_KNEE);
@@ -790,7 +844,7 @@ mod tests {
             ("a", &[&[0.4f32, 0.4, 0.4, 0.4]]),
             ("b", &[&[0.2f32, 0.2]]), // only 2 samples available right now
         ]);
-        let mixed = drain_and_sum(&mut queues, 1).expect("still a real contributor");
+        let mixed = drain_and_sum(&mut queues, 1, &mut HashMap::new()).expect("still a real contributor");
         // Only 2 frames this cycle (the shorter of the two). Levels stay
         // under the soft-clip knee on purpose — this test is about frame
         // counts, and a shaped sum would make it assert two things at once.
@@ -800,10 +854,87 @@ mod tests {
         assert_eq!(queues["a"][0], VecDeque::from(vec![0.4, 0.4]));
     }
 
+    /// The mix waits for a contributor that is momentarily behind — that
+    /// is the whole point of syncing to the slowest, and padding it with
+    /// silence instead is what caused live-reported distortion on
+    /// 2026-07-24. Ordinary callback jitter must not trip the stall
+    /// guard.
+    #[test]
+    fn a_contributor_that_is_briefly_behind_is_still_waited_for() {
+        let mut stalled = HashMap::new();
+        let mut queues = queues_from(&[("a", &[&[0.4f32, 0.4]]), ("b", &[&[] as &[f32]])]);
+
+        for cycle in 0..MIX_STALL_CYCLES {
+            assert_eq!(
+                drain_and_sum(&mut queues, 1, &mut stalled),
+                None,
+                "cycle {cycle}: must wait, not play without b"
+            );
+        }
+        // And "a"'s audio is still queued, not consumed or discarded.
+        assert_eq!(queues["a"][0], VecDeque::from(vec![0.4, 0.4]));
+    }
+
+    /// The failure this guard exists for: a media shot that ends or is
+    /// paused simply stops firing audio callbacks. Its queue drains to
+    /// empty and never refills, and without a bound the *entire* preview
+    /// mix stays silent waiting for audio that is never coming.
+    #[test]
+    fn a_contributor_that_stops_forever_does_not_mute_the_whole_mix() {
+        let mut stalled = HashMap::new();
+        let mut queues = queues_from(&[("plays-on", &[&[0.4f32]]), ("stopped", &[&[] as &[f32]])]);
+
+        // Burn through the grace period.
+        for _ in 0..MIX_STALL_CYCLES {
+            assert_eq!(drain_and_sum(&mut queues, 1, &mut stalled), None);
+        }
+        // Past it, the mix plays what it has.
+        let mixed = drain_and_sum(&mut queues, 1, &mut stalled).expect("must not stay silent");
+        assert_eq!(mixed, vec![0.4]);
+    }
+
+    #[test]
+    fn a_stalled_contributor_rejoins_the_moment_it_has_audio_again() {
+        let mut stalled = HashMap::new();
+        let mut queues = queues_from(&[("a", &[&[0.4f32]]), ("resumes", &[&[] as &[f32]])]);
+        for _ in 0..=MIX_STALL_CYCLES {
+            let _ = drain_and_sum(&mut queues, 1, &mut stalled);
+        }
+        assert!(stalled["resumes"] > MIX_STALL_CYCLES, "should be given up on by now");
+
+        // It starts producing again; both contribute, and the count resets
+        // so it gets the full grace period next time rather than being
+        // dropped instantly.
+        queues.get_mut("a").unwrap()[0].push_back(0.4);
+        queues.get_mut("resumes").unwrap()[0].push_back(0.2);
+        let mixed = drain_and_sum(&mut queues, 1, &mut stalled).expect("both contributing");
+        assert_eq!(mixed.len(), 1);
+        assert!((mixed[0] - 0.6).abs() < 1e-6, "{} should be the sum", mixed[0]);
+        assert_eq!(stalled["resumes"], 0, "must start fresh, not on a hair trigger");
+    }
+
+    #[test]
+    fn stall_counts_do_not_outlive_a_source_leaving_the_mix() {
+        let mut stalled = HashMap::new();
+        let mut queues = queues_from(&[("a", &[&[0.4f32]]), ("leaving", &[&[] as &[f32]])]);
+        for _ in 0..=MIX_STALL_CYCLES {
+            let _ = drain_and_sum(&mut queues, 1, &mut stalled);
+        }
+        assert!(stalled.contains_key("leaving"));
+
+        // `set_mix_sources` drops departed sources' queues; the stall
+        // bookkeeping must not keep a verdict for a name that could
+        // later rejoin as a different shot.
+        queues.remove("leaving");
+        queues.get_mut("a").unwrap()[0].push_back(0.4);
+        let _ = drain_and_sum(&mut queues, 1, &mut stalled);
+        assert!(!stalled.contains_key("leaving"));
+    }
+
     #[test]
     fn drain_and_sum_handles_multiple_channels_independently() {
         let mut queues = queues_from(&[("a", &[&[0.5f32, 0.5], &[-0.5f32, -0.5]])]);
-        let mixed = drain_and_sum(&mut queues, 2).expect("one contributor, two channels");
+        let mixed = drain_and_sum(&mut queues, 2, &mut HashMap::new()).expect("one contributor, two channels");
         // Planar layout: channel 0's frames, then channel 1's. Under the
         // soft-clip knee so this asserts layout only.
         assert_eq!(mixed, vec![0.5, 0.5, -0.5, -0.5]);
@@ -815,13 +946,13 @@ mod tests {
         // so this isn't expected in practice, but must never panic/index
         // out of bounds if it somehow happened.
         let mut queues = queues_from(&[("mono-in-a-stereo-mix", &[&[1.0f32, 1.0]])]);
-        assert_eq!(drain_and_sum(&mut queues, 2), None);
+        assert_eq!(drain_and_sum(&mut queues, 2, &mut HashMap::new()), None);
     }
 
     #[test]
     fn drain_and_sum_is_none_when_nothing_contributed() {
         let mut queues = HashMap::new();
-        assert_eq!(drain_and_sum(&mut queues, 2), None);
+        assert_eq!(drain_and_sum(&mut queues, 2, &mut HashMap::new()), None);
     }
 
     #[test]
@@ -831,7 +962,7 @@ mod tests {
         // missing one — must not produce a bogus zero-length "contributed"
         // result.
         let mut queues = queues_from(&[("a", &[&[]])]);
-        assert_eq!(drain_and_sum(&mut queues, 1), None);
+        assert_eq!(drain_and_sum(&mut queues, 1, &mut HashMap::new()), None);
     }
 
     #[test]
