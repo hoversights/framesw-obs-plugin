@@ -2047,22 +2047,170 @@ fn raise_framesw() {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW: without it this flashes a console window on
-        // every click, in front of the very app we are raising.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        // AppActivate matches a window-title substring, which for
-        // FrameSW's main window always contains "FrameSW". The click that
-        // ran this callback gave OBS foreground rights, so Windows permits
-        // handing the foreground on.
-        let _ = std::process::Command::new("powershell")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args([
-                "-NoProfile",
-                "-Command",
-                "(New-Object -ComObject WScript.Shell).AppActivate('FrameSW')",
-            ])
-            .spawn();
+        // Win32 directly, not `powershell -Command AppActivate`. That is
+        // what shipped here first and it never once worked, for a reason
+        // this comment previously had backwards: AppActivate does NOT
+        // match a substring. It matches the window title exactly, or by
+        // prefix, or by suffix. FrameSW's title is
+        //
+        //     no project <middot> no show <emdash> FrameSW 1.0.20
+        //
+        // so "FrameSW" sits in the middle and matches none of the three.
+        // MEASURED 2026-09-15 against 1.0.9 and again 2026-09-21 against
+        // 1.0.20; broken since the feature landed, by no later change.
+        //
+        // Worse than doing nothing: on 2026-09-21 the same call returned
+        // TRUE on the dev machine, because the prefix rule matched a
+        // different window that began with "FrameSW" - the editor, titled
+        // "FrameSW plugin build and... - framesw - Visual Studio Code".
+        // A title prefix is not an identity, so the old call could raise
+        // any window starting with those seven letters. There is no
+        // spelling of the AppActivate argument that fixes that.
+        //
+        // So match on something that IS an identity: the owning process's
+        // executable. Dropping the subprocess also removes the
+        // CREATE_NO_WINDOW workaround (without it a console flashed in
+        // front of the very app being raised) and the spawn latency.
+        match find_framesw_window() {
+            Some(hwnd) => unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+                };
+                // Restore first if minimized: SetForegroundWindow on an
+                // iconic window un-hides nothing, and "I cannot see
+                // FrameSW" is exactly when this menu item gets clicked.
+                if IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                }
+                // The click that ran this callback gave OBS foreground
+                // rights, so Windows permits handing the foreground on.
+                SetForegroundWindow(hwnd);
+            },
+            None => log_line("Show FrameSW: no framesw.exe window found"),
+        }
+    }
+}
+
+/// Whether a full executable path is FrameSW's own.
+///
+/// Compares the file name only, case-insensitively: Windows paths are
+/// case-insensitive, and the installed app, a debug build and a
+/// target/release build are the same `framesw.exe`
+/// (`packaging/windows/installer.nsi`'s `APP_EXE`) at three different
+/// paths. Deliberately an equality test on the file name and not a
+/// `contains` - a loose match on a name is the exact mistake this
+/// replaces.
+#[cfg(target_os = "windows")]
+fn exe_is_framesw(full_path: &str) -> bool {
+    full_path
+        .rsplit(['\\', '/'])
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case("framesw.exe"))
+}
+
+/// FrameSW's main window, found by which process owns it rather than by
+/// what it is called.
+///
+/// Visible and titled are cheap pre-filters, and the title is never
+/// compared against anything - it only tells the real window apart from
+/// the message-only and tool windows a GUI process also owns.
+#[cfg(target_os = "windows")]
+fn find_framesw_window() -> Option<windows_sys::Win32::Foundation::HWND> {
+    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, MAX_PATH};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let found = &mut *(lparam as *mut Option<HWND>);
+        if IsWindowVisible(hwnd) == 0 || GetWindowTextLengthW(hwnd) == 0 {
+            return 1; // keep enumerating
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return 1;
+        }
+        // QUERY_LIMITED_INFORMATION, not QUERY_INFORMATION + VM_READ:
+        // enough for the image name and the only one of the two that a
+        // normal-integrity OBS is reliably granted.
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // Access denied against another user's or an elevated
+            // process is ordinary here - not worth a log line per window
+            // per click.
+            return 1;
+        }
+        let mut buf = [0u16; MAX_PATH as usize];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len);
+        CloseHandle(handle);
+        if ok != 0 && exe_is_framesw(&String::from_utf16_lossy(&buf[..len as usize])) {
+            *found = Some(hwnd);
+            return 0; // stop
+        }
+        1
+    }
+
+    let mut found: Option<HWND> = None;
+    unsafe {
+        EnumWindows(Some(enum_cb), &mut found as *mut Option<HWND> as LPARAM);
+    }
+    found
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod show_framesw_tests {
+    use super::exe_is_framesw;
+
+    /// The three real paths the same executable is found at.
+    #[test]
+    fn every_real_framesw_path_matches() {
+        assert!(exe_is_framesw(r"C:\Program Files\FrameSW\framesw.exe"));
+        assert!(exe_is_framesw(r"C:\Users\coinb\framesw\target\debug\framesw.exe"));
+        assert!(exe_is_framesw(r"C:\Users\coinb\framesw\target\release\framesw.exe"));
+    }
+
+    /// Windows paths are case-insensitive, so the comparison has to be.
+    #[test]
+    fn the_name_is_matched_case_insensitively() {
+        assert!(exe_is_framesw(r"C:\PROGRAM FILES\FRAMESW\FRAMESW.EXE"));
+        assert!(exe_is_framesw(r"c:\program files\framesw\FrameSW.exe"));
+    }
+
+    /// The regression this function exists for. `AppActivate("FrameSW")`
+    /// matched the editor because its title merely BEGAN with those
+    /// letters; a name that merely contains or begins with "framesw" must
+    /// not match here either. Run against a `contains`-based
+    /// implementation, all four of these fail.
+    #[test]
+    fn a_name_that_only_resembles_framesw_does_not_match() {
+        assert!(!exe_is_framesw(r"C:\Program Files\Microsoft VS Code\Code.exe"));
+        assert!(!exe_is_framesw(r"C:\tools\framesw-helper.exe"));
+        assert!(!exe_is_framesw(r"C:\tools\not-framesw.exe"));
+        // The directory is called framesw; the executable is not.
+        assert!(!exe_is_framesw(r"C:\Users\coinb\framesw\target\debug\build-script.exe"));
+    }
+
+    /// A bare name with no directory is still a name.
+    #[test]
+    fn a_path_with_no_separator_still_matches() {
+        assert!(exe_is_framesw("framesw.exe"));
+        assert!(!exe_is_framesw("obs64.exe"));
+    }
+
+    /// Forward slashes appear in paths that have been through a tool.
+    #[test]
+    fn forward_slashes_are_separators_too() {
+        assert!(exe_is_framesw("C:/Program Files/FrameSW/framesw.exe"));
+    }
+
+    #[test]
+    fn an_empty_path_is_not_framesw() {
+        assert!(!exe_is_framesw(""));
     }
 }
 
