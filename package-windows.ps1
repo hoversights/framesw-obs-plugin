@@ -40,6 +40,17 @@ Copy-Item "target\release\framesw_obs_plugin.dll" `
 # stamp automatically, with no bump discipline required at all.
 $VersionLine = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
 $Version = $VersionLine.Matches.Groups[1].Value
+# $ErrorActionPreference is deliberately relaxed across these git calls.
+# With it at "Stop", PowerShell 5.1 wraps ANY line a native command writes
+# to stderr in a NativeCommandError and terminates the script - and git
+# writes "warning: in the working copy of '...', LF will be replaced by
+# CRLF" to stderr routinely on this machine. `2>$null` does not help: the
+# wrap happens before the redirect. The effect was that packaging failed
+# exactly when the working tree was dirty, which is the only situation the
+# -dirty stamp below exists for. Found 2026-09-21 while packaging the
+# Show FrameSW fix.
+$PrevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 $GitSha = (git rev-parse --short HEAD 2>$null)
 if (-not $GitSha) { $GitSha = "unknown" }
 $GitDirty = ""
@@ -49,6 +60,7 @@ else {
     git diff --cached --quiet 2>$null
     if ($LASTEXITCODE -ne 0) { $GitDirty = "-dirty" }
 }
+$ErrorActionPreference = $PrevEap
 $Stamp = "$Version+$GitSha$GitDirty"
 Set-Content -Path "$PluginDir\VERSION" -Value $Stamp -NoNewline
 
