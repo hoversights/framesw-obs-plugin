@@ -51,6 +51,7 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::atomic::Ordering;
 
 mod audio_tap;
+mod input_probe;
 mod ndi_ffi;
 mod shm_ring;
 mod video_tap;
@@ -2284,7 +2285,10 @@ pub extern "C" fn obs_module_post_load() {
             ("start_video_feed", video_tap::handle_start_video_feed as calldata::RequestCallbackFn),
             ("stop_video_feed", video_tap::handle_stop_video_feed as calldata::RequestCallbackFn),
             ("video_feed_status", video_tap::handle_video_feed_status as calldata::RequestCallbackFn),
-        ] {
+        ]
+        .into_iter()
+        .chain(input_probe::requests())
+        {
             if calldata::register_request(vendor, request_type, callback) {
                 log_line(&format!("registered vendor request \"{request_type}\""));
             } else {

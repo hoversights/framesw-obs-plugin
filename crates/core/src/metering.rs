@@ -114,6 +114,18 @@ pub struct ObsAudioInfo {
 }
 crate::resolved_fn!(obs_get_audio_info: extern "C" fn(*mut ObsAudioInfo) -> bool);
 
+/// How many channels OBS is mixing (its speaker layout), or 0 if unknown.
+/// Every source is converted to this layout before its capture callbacks
+/// fire, so it is how many planes of `audio_data` carry samples.
+pub fn output_channels() -> usize {
+    obs_get_audio_info()
+        .and_then(|get_info| {
+            let mut info = ObsAudioInfo { samples_per_sec: 0, speakers: 0 };
+            get_info(&mut info).then_some(info)
+        })
+        .map_or(0, |info| speaker_layout_to_channels(info.speakers) as usize)
+}
+
 /// `libobs/media-io/audio-io.h`'s `get_audio_channels` — a `static
 /// inline` C function, so it has no linkable symbol to resolve; this is
 /// the same lookup table ported by hand, values verified against the
