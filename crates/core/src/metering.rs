@@ -707,7 +707,10 @@ pub fn packet_levels(planes: &[Option<&[f32]>], volume: f32, muted: bool) -> (f3
         .iter()
         .map(|plane| {
             let peak = plane.map_or(0.0, |samples| samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()))) * volume;
-            if muted || peak <= 0.0 { -100.0 } else { 20.0 * peak.log10() }
+            // Floored at −100 like the headline, so a channel carrying a
+            // trace of signal never reads below it (seen: −147 per channel
+            // beside a −100 headline, 2026-09-25).
+            if muted || peak <= 0.0 { -100.0 } else { (20.0 * peak.log10()).max(-100.0) }
         })
         .collect();
     let loudest = channels_db.iter().copied().fold(-100.0f32, f32::max);
@@ -1289,6 +1292,15 @@ mod tests {
         let (loudest, channels) = packet_levels(&[Some(&left), Some(&right)], 1.0, true);
         assert_eq!(loudest, -100.0);
         assert!(channels.iter().all(|&c| c == -100.0));
+    }
+
+    #[test]
+    fn a_trace_of_signal_floors_at_minus_100_on_every_channel() {
+        let left = [1e-8f32];
+        let right = [0.5f32];
+        let (loudest, channels) = packet_levels(&[Some(&left), Some(&right)], 1.0, false);
+        assert_eq!(channels[0], -100.0);
+        assert!(close(loudest, -6.02));
     }
 
     #[test]
