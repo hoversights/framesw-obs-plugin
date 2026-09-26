@@ -68,11 +68,15 @@ fn cstr(s: &str) -> CString {
 /// which is the entire reason this plugin exists.
 pub struct SourceLevel {
     pub name: String,
+    /// The loudest channel.
     pub peak_db: f32,
     pub active: bool,
+    /// Every channel on its own, in OBS's channel order (L, R, …).
+    pub channels_db: Vec<f32>,
 }
 
-/// Builds `{"levels": [{"name": ..., "peak_db": ..., "on_program": ...}, ...]}`
+/// Builds `{"levels": [{"name": ..., "peak_db": ..., "on_program": ...,
+/// "channel_peaks": [{"db": ...}, ...]}, ...]}`
 /// as a real `obs_data_t*`, ready to hand to
 /// `calldata::vendor_emit_event`. Caller owns the returned pointer and
 /// must release it via `release` once the emit call returns (per
@@ -131,6 +135,22 @@ pub fn build_levels_payload(levels: &[SourceLevel]) -> *mut ObsDataT {
         // do exist in the wild, and tolerance there costs nothing.
         let on_program_key = cstr("on_program");
         obs_data_set_bool(entry, on_program_key.as_ptr(), level.active);
+        // Per channel, as objects: obs_data arrays hold objects, not bare
+        // numbers. `peak_db` above stays the loudest channel, so a FrameSW
+        // that doesn't read this still gets the right headline level.
+        if !level.channels_db.is_empty() {
+            let channels = obs_data_array_create();
+            let db_key = cstr("db");
+            for db in &level.channels_db {
+                let channel = obs_data_create();
+                obs_data_set_double(channel, db_key.as_ptr(), *db as f64);
+                obs_data_array_push_back(channels, channel);
+                obs_data_release(channel);
+            }
+            let channels_key = cstr("channel_peaks");
+            obs_data_set_array(entry, channels_key.as_ptr(), channels);
+            obs_data_array_release(channels);
+        }
         // `obs_data_array_push_back` addrefs its own copy internally
         // (standard OBS refcounting convention for every "add/set" call
         // in this API) — release our local ref immediately afterward
