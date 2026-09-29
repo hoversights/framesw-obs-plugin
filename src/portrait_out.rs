@@ -1,0 +1,542 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// FrameSW Companion Plugin for OBS Studio
+// Copyright (C) 2026 Hoversights
+//
+// This program is free software; you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by the
+// Free Software Foundation; either version 2 of the License, or (at your
+// option) any later version.
+//
+// This program is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License along
+// with this program; if not, see <https://www.gnu.org/licenses/>.
+
+//! SPIKE (FrameSW MULTISTREAM_PLAN.md, Phase 0): a portrait picture of one
+//! scene, encoded on its own and sent over RTMP beside OBS's own stream.
+//! Built to be measured, not shipped.
+//!
+//! Every new declaration was checked against obs-studio **32.2.2** (the
+//! installed OBS), fetched with curl on 2026-09-29: `libobs/obs.h`
+//! (`obs_enum_encoder_types` 697, `obs_get_audio` 709, `obs_output_active`
+//! 1948, `obs_output_set_video_encoder` 2017, `obs_output_set_audio_encoder`
+//! 2037, `obs_output_set_service` 2061, `obs_output_get_total_bytes` 2071,
+//! `obs_output_get_frames_dropped` 2072, `obs_output_get_total_frames` 2073,
+//! `obs_video_encoder_create` 2237, `obs_audio_encoder_create` 2249,
+//! `obs_encoder_release` 2256, `obs_encoder_set_video` 2413,
+//! `obs_encoder_set_audio` 2416, `obs_service_create_private` 2487,
+//! `obs_service_release` 2493) and `libobs/obs-encoder.c`.
+//!
+//! Facts from that source the code depends on:
+//! - An encoder may take any mix's `video_t`, a view's included:
+//!   `get_mix_for_video` finds the view's mix. The GPU path is used when the
+//!   encoder takes textures and the mix makes them; otherwise
+//!   `start_raw_video` raises the mix's `raw_active`.
+//! - `obs_encoder_set_video` refuses once the encoder is active or
+//!   initialised, so it is set before the output starts.
+//! - Unlike the monitor feeds (`video_tap.rs`), the view's BASE size is the
+//!   portrait frame, so a scene laid out in portrait coordinates fills it.
+//!   Whether a scene renders unclipped past the canvas's own size is what
+//!   this spike measures.
+//! - Teardown order: the output (its release stops it and joins), then the
+//!   encoders and the service, then the view, with `obs_view_remove`
+//!   before `obs_view_destroy` (`video_tap.rs`'s header).
+//!
+//! **The stream key is a secret.** It goes from the request into the
+//! service's settings and nowhere else: never logged, never in a status.
+
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::sync::{Mutex, PoisonError};
+
+use crate::log_line;
+use crate::video_tap::{self, ObsViewT, VideoT, EVENT_EXIT, EVENT_SCENE_COLLECTION_CLEANUP};
+use studio_mode_meters_core::metering::{
+    ffi_guard, obs_get_source_by_name, obs_queue_task, obs_source_release, ObsOutputT, ObsSourceT, OBS_TASK_UI,
+};
+use studio_mode_meters_core::obs_data::{self, ObsDataT};
+
+pub enum ObsEncoderT {}
+pub enum ObsServiceT {}
+pub enum AudioT {}
+
+studio_mode_meters_core::resolved_fn!(
+    obs_video_encoder_create: extern "C" fn(*const c_char, *const c_char, *mut ObsDataT, *mut ObsDataT) -> *mut ObsEncoderT
+);
+studio_mode_meters_core::resolved_fn!(
+    obs_audio_encoder_create:
+        extern "C" fn(*const c_char, *const c_char, *mut ObsDataT, usize, *mut ObsDataT) -> *mut ObsEncoderT
+);
+studio_mode_meters_core::resolved_fn!(obs_encoder_release: extern "C" fn(*mut ObsEncoderT));
+studio_mode_meters_core::resolved_fn!(obs_encoder_set_video: extern "C" fn(*mut ObsEncoderT, *mut VideoT));
+studio_mode_meters_core::resolved_fn!(obs_encoder_set_audio: extern "C" fn(*mut ObsEncoderT, *mut AudioT));
+studio_mode_meters_core::resolved_fn!(obs_get_audio: extern "C" fn() -> *mut AudioT);
+studio_mode_meters_core::resolved_fn!(
+    obs_service_create_private: extern "C" fn(*const c_char, *const c_char, *mut ObsDataT) -> *mut ObsServiceT
+);
+studio_mode_meters_core::resolved_fn!(obs_service_release: extern "C" fn(*mut ObsServiceT));
+studio_mode_meters_core::resolved_fn!(obs_output_set_video_encoder: extern "C" fn(*mut ObsOutputT, *mut ObsEncoderT));
+studio_mode_meters_core::resolved_fn!(
+    obs_output_set_audio_encoder: extern "C" fn(*mut ObsOutputT, *mut ObsEncoderT, usize)
+);
+studio_mode_meters_core::resolved_fn!(obs_output_set_service: extern "C" fn(*mut ObsOutputT, *mut ObsServiceT));
+studio_mode_meters_core::resolved_fn!(obs_output_active: extern "C" fn(*const ObsOutputT) -> bool);
+studio_mode_meters_core::resolved_fn!(obs_output_get_total_bytes: extern "C" fn(*const ObsOutputT) -> u64);
+studio_mode_meters_core::resolved_fn!(obs_output_get_frames_dropped: extern "C" fn(*const ObsOutputT) -> c_int);
+studio_mode_meters_core::resolved_fn!(obs_output_get_total_frames: extern "C" fn(*const ObsOutputT) -> c_int);
+studio_mode_meters_core::resolved_fn!(obs_enum_encoder_types: extern "C" fn(usize, *mut *const c_char) -> bool);
+
+/// The running portrait output. Its pointers are libobs objects this
+/// plugin holds a reference to, touched only on OBS's UI thread (start,
+/// stop) or through libobs's thread-safe getters (status).
+struct Out {
+    view: *mut ObsViewT,
+    video_enc: *mut ObsEncoderT,
+    audio_enc: *mut ObsEncoderT,
+    service: *mut ObsServiceT,
+    output: *mut ObsOutputT,
+    scene: String,
+    video_encoder: String,
+    size: (u32, u32),
+}
+
+// SAFETY: libobs objects are reference-counted and safe to hand between
+// threads; every mutation here runs on OBS's UI thread (`run_on_ui`).
+unsafe impl Send for Out {}
+
+static OUT: Mutex<Option<Out>> = Mutex::new(None);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn cstr(ptr: *const c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+}
+
+fn release_source(source: *mut ObsSourceT) {
+    if !source.is_null() {
+        if let Some(release) = obs_source_release() {
+            release(source);
+        }
+    }
+}
+
+struct Start {
+    scene: String,
+    server: String,
+    key: String,
+    video_encoder: String,
+    audio_encoder: String,
+    bitrate: i64,
+    width: u32,
+    height: u32,
+}
+
+fn default_video_encoder() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "com.apple.videotoolbox.videoencoder.ave.avc"
+    } else {
+        "obs_x264"
+    }
+}
+
+fn default_audio_encoder() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "CoreAudio_AAC"
+    } else {
+        "ffmpeg_aac"
+    }
+}
+
+fn new_data() -> Result<*mut ObsDataT, String> {
+    let create = obs_data::obs_data_create().ok_or("obs_data_create unavailable")?;
+    let data = create();
+    if data.is_null() {
+        return Err("obs_data_create returned null".into());
+    }
+    Ok(data)
+}
+
+fn start(req: &Start) -> Result<(), String> {
+    if lock(&OUT).is_some() {
+        return Err("a portrait output is already running".into());
+    }
+    let mut out = Out {
+        view: std::ptr::null_mut(),
+        video_enc: std::ptr::null_mut(),
+        audio_enc: std::ptr::null_mut(),
+        service: std::ptr::null_mut(),
+        output: std::ptr::null_mut(),
+        scene: req.scene.clone(),
+        video_encoder: req.video_encoder.clone(),
+        size: (req.width, req.height),
+    };
+    match build(&mut out, req) {
+        Ok(()) => {
+            // The server only: the key is never logged.
+            log_line(&format!(
+                "portrait output started: scene '{}', {}x{}, {} at {} kbps, to {}",
+                req.scene, req.width, req.height, req.video_encoder, req.bitrate, req.server
+            ));
+            *lock(&OUT) = Some(out);
+            register_event_callback();
+            Ok(())
+        }
+        Err(e) => {
+            log_line(&format!("portrait output failed to start: {e}"));
+            teardown(out);
+            Err(e)
+        }
+    }
+}
+
+/// Builds `out` step by step. Leaves whatever it made in `out`, so the
+/// caller's `teardown` undoes exactly that on failure.
+fn build(out: &mut Out, req: &Start) -> Result<(), String> {
+    // The picture: a view of the scene, at the portrait size.
+    let get_source = obs_get_source_by_name().ok_or("obs_get_source_by_name unavailable")?;
+    let (Some(view_create), Some(set_source), Some(add2)) =
+        (video_tap::obs_view_create(), video_tap::obs_view_set_source(), video_tap::obs_view_add2())
+    else {
+        return Err("obs_view_* unavailable".into());
+    };
+    let cscene = CString::new(req.scene.as_str()).map_err(|e| e.to_string())?;
+    let scene = get_source(cscene.as_ptr());
+    if scene.is_null() {
+        return Err(format!("no scene named '{}'", req.scene));
+    }
+    out.view = view_create();
+    if out.view.is_null() {
+        release_source(scene);
+        return Err("obs_view_create returned null".into());
+    }
+    set_source(out.view, 0, scene);
+    release_source(scene);
+    let mut ovi = video_tap::portrait_ovi(req.width, req.height)?;
+    let video = add2(out.view, &mut ovi);
+    if video.is_null() {
+        return Err("obs_view_add2 returned null".into());
+    }
+
+    // Its encoders.
+    let venc_create = obs_video_encoder_create().ok_or("obs_video_encoder_create unavailable")?;
+    let aenc_create = obs_audio_encoder_create().ok_or("obs_audio_encoder_create unavailable")?;
+    let set_video = obs_encoder_set_video().ok_or("obs_encoder_set_video unavailable")?;
+    let set_audio = obs_encoder_set_audio().ok_or("obs_encoder_set_audio unavailable")?;
+    let get_audio = obs_get_audio().ok_or("obs_get_audio unavailable")?;
+
+    let settings = new_data()?;
+    obs_data::set_string(settings, "rate_control", "CBR");
+    obs_data::set_int(settings, "bitrate", req.bitrate);
+    // Two seconds: what YouTube asks for.
+    obs_data::set_int(settings, "keyint_sec", 2);
+    if req.video_encoder == "obs_x264" {
+        obs_data::set_string(settings, "preset", "veryfast");
+    }
+    let vid = CString::new(req.video_encoder.as_str()).map_err(|e| e.to_string())?;
+    out.video_enc = venc_create(vid.as_ptr(), c"FrameSW portrait video".as_ptr(), settings, std::ptr::null_mut());
+    obs_data::release(settings);
+    if out.video_enc.is_null() {
+        return Err(format!("video encoder '{}' unavailable", req.video_encoder));
+    }
+    set_video(out.video_enc, video);
+
+    let settings = new_data()?;
+    obs_data::set_int(settings, "bitrate", 160);
+    let aid = CString::new(req.audio_encoder.as_str()).map_err(|e| e.to_string())?;
+    out.audio_enc =
+        aenc_create(aid.as_ptr(), c"FrameSW portrait audio".as_ptr(), settings, 0, std::ptr::null_mut());
+    obs_data::release(settings);
+    if out.audio_enc.is_null() {
+        return Err(format!("audio encoder '{}' unavailable", req.audio_encoder));
+    }
+    set_audio(out.audio_enc, get_audio());
+
+    // Where it goes. The key lives in these settings and nowhere else.
+    let service_create = obs_service_create_private().ok_or("obs_service_create_private unavailable")?;
+    let settings = new_data()?;
+    obs_data::set_string(settings, "server", &req.server);
+    obs_data::set_string(settings, "key", &req.key);
+    out.service = service_create(c"rtmp_custom".as_ptr(), c"FrameSW portrait service".as_ptr(), settings);
+    obs_data::release(settings);
+    if out.service.is_null() {
+        return Err("the rtmp_custom service couldn't be created".into());
+    }
+
+    // The output that sends it.
+    let output_create = video_tap::obs_output_create().ok_or("obs_output_create unavailable")?;
+    let set_venc = obs_output_set_video_encoder().ok_or("obs_output_set_video_encoder unavailable")?;
+    let set_aenc = obs_output_set_audio_encoder().ok_or("obs_output_set_audio_encoder unavailable")?;
+    let set_service = obs_output_set_service().ok_or("obs_output_set_service unavailable")?;
+    let output_start = video_tap::obs_output_start().ok_or("obs_output_start unavailable")?;
+    out.output = output_create(
+        c"rtmp_output".as_ptr(),
+        c"FrameSW portrait".as_ptr(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    if out.output.is_null() {
+        return Err("the rtmp_output couldn't be created".into());
+    }
+    set_venc(out.output, out.video_enc);
+    set_aenc(out.output, out.audio_enc, 0);
+    set_service(out.output, out.service);
+    if !output_start(out.output) {
+        let err = video_tap::obs_output_get_last_error().map_or(String::new(), |f| cstr(f(out.output)));
+        return Err(format!("obs_output_start failed: {err}"));
+    }
+    Ok(())
+}
+
+fn teardown(out: Out) {
+    if !out.output.is_null() {
+        if obs_output_active().is_some_and(|active| active(out.output)) {
+            if let Some(stop) = video_tap::obs_output_stop() {
+                stop(out.output);
+            }
+        }
+        // The last reference: destroy waits for the stop and joins its
+        // threads, so nothing of the output runs after this returns.
+        if let Some(release) = video_tap::obs_output_release() {
+            release(out.output);
+        }
+    }
+    if let Some(release) = obs_encoder_release() {
+        for enc in [out.video_enc, out.audio_enc] {
+            if !enc.is_null() {
+                release(enc);
+            }
+        }
+    }
+    if !out.service.is_null() {
+        if let Some(release) = obs_service_release() {
+            release(out.service);
+        }
+    }
+    if !out.view.is_null() {
+        if let Some(set_source) = video_tap::obs_view_set_source() {
+            set_source(out.view, 0, std::ptr::null_mut());
+        }
+        // `obs_view_remove` before `obs_view_destroy`: destroy alone
+        // leaves the view in the render loop.
+        if let Some(remove) = video_tap::obs_view_remove() {
+            remove(out.view);
+        }
+        if let Some(destroy) = video_tap::obs_view_destroy() {
+            destroy(out.view);
+        }
+    }
+}
+
+/// Stops the portrait output, if there is one, and stops listening for
+/// OBS's events. On OBS's UI thread.
+pub fn stop_all() {
+    stop_output();
+    unregister_event_callback();
+}
+
+/// The output only: for module unload, when the frontend's callbacks are
+/// already gone and must not be touched (lib.rs, `obs_module_unload`).
+pub fn stop_output() {
+    let out = lock(&OUT).take();
+    if let Some(out) = out {
+        let scene = out.scene.clone();
+        teardown(out);
+        log_line(&format!("portrait output stopped (scene '{scene}')"));
+    }
+}
+
+// ---------------------------------------------------------------------
+// OBS quitting, or the scene collection going away
+// ---------------------------------------------------------------------
+
+static EVENTS_REGISTERED: Mutex<bool> = Mutex::new(false);
+
+fn register_event_callback() {
+    let mut registered = lock(&EVENTS_REGISTERED);
+    if *registered {
+        return;
+    }
+    match video_tap::obs_frontend_add_event_callback() {
+        Some(add) => {
+            add(on_frontend_event, std::ptr::null_mut());
+            *registered = true;
+        }
+        None => log_line("obs_frontend_add_event_callback unavailable: stop the portrait output before quitting OBS"),
+    }
+}
+
+fn unregister_event_callback() {
+    let mut registered = lock(&EVENTS_REGISTERED);
+    if !*registered {
+        return;
+    }
+    if let Some(remove) = video_tap::obs_frontend_remove_event_callback() {
+        remove(on_frontend_event, std::ptr::null_mut());
+    }
+    *registered = false;
+}
+
+extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
+    ffi_guard(
+        "portrait_out::on_frontend_event",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            // The view holds the scene: it lets go before the collection
+            // is torn down, and the output stops before OBS does.
+            if event == EVENT_EXIT || event == EVENT_SCENE_COLLECTION_CLEANUP {
+                stop_all();
+            }
+        }),
+    );
+}
+
+// ---------------------------------------------------------------------
+// Vendor requests
+// ---------------------------------------------------------------------
+
+struct UiCall {
+    ran: bool,
+    request: Option<Start>, // None = stop
+    result: Result<(), String>,
+}
+
+extern "C" fn run_on_ui_thread(param: *mut c_void) {
+    ffi_guard(
+        "portrait_out::run_on_ui_thread",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            if param.is_null() {
+                return;
+            }
+            let call = unsafe { &mut *param.cast::<UiCall>() };
+            call.ran = true;
+            call.result = match &call.request {
+                Some(req) => start(req),
+                None => {
+                    stop_all();
+                    Ok(())
+                }
+            };
+        }),
+    );
+}
+
+fn run_on_ui(request: Option<Start>) -> Result<(), String> {
+    let queue = obs_queue_task().ok_or("obs_queue_task unavailable")?;
+    let mut call = UiCall { ran: false, request, result: Ok(()) };
+    queue(OBS_TASK_UI, run_on_ui_thread, (&mut call as *mut UiCall).cast(), true);
+    if !call.ran {
+        return Err("UI task handler unavailable".into());
+    }
+    call.result
+}
+
+/// Request: `{"scene", "server", "key"}` required; `"video_encoder"`,
+/// `"audio_encoder"`, `"bitrate"` (kbps, 6000), `"width"` (1080) and
+/// `"height"` (1920) optional. Response: `{"ok": true}` or `{"ok": false,
+/// "error": "..."}`.
+pub extern "C" fn handle_start_portrait_out(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
+    ffi_guard(
+        "handle_start_portrait_out",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            let request = obs_data::from_void(request_data);
+            let response = obs_data::from_void(response_data);
+            let text = |key: &str| obs_data::get_string(request, key).filter(|s| !s.is_empty());
+            let (Some(scene), Some(server), Some(key)) = (text("scene"), text("server"), text("key")) else {
+                obs_data::set_bool(response, "ok", false);
+                obs_data::set_string(response, "error", "scene, server and key are required");
+                return;
+            };
+            let req = Start {
+                scene,
+                server,
+                key,
+                video_encoder: text("video_encoder").unwrap_or_else(|| default_video_encoder().into()),
+                audio_encoder: text("audio_encoder").unwrap_or_else(|| default_audio_encoder().into()),
+                bitrate: obs_data::get_optional_int(request, "bitrate").filter(|b| *b > 0).unwrap_or(6000),
+                width: obs_data::get_optional_int(request, "width").filter(|w| *w > 0).unwrap_or(1080) as u32,
+                height: obs_data::get_optional_int(request, "height").filter(|h| *h > 0).unwrap_or(1920) as u32,
+            };
+            match run_on_ui(Some(req)) {
+                Ok(()) => obs_data::set_bool(response, "ok", true),
+                Err(e) => {
+                    obs_data::set_bool(response, "ok", false);
+                    obs_data::set_string(response, "error", &e);
+                }
+            }
+        }),
+    );
+}
+
+/// Request: `{}`. Response: `{"ok": true}`.
+pub extern "C" fn handle_stop_portrait_out(_request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
+    ffi_guard(
+        "handle_stop_portrait_out",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            let response = obs_data::from_void(response_data);
+            match run_on_ui(None) {
+                Ok(()) => obs_data::set_bool(response, "ok", true),
+                Err(e) => {
+                    obs_data::set_bool(response, "ok", false);
+                    obs_data::set_string(response, "error", &e);
+                }
+            }
+        }),
+    );
+}
+
+/// Request: `{}`. Response: `{"active", "frames", "dropped", "bytes",
+/// "last_error", "scene", "video_encoder", "width", "height",
+/// "encoders"}`; `"encoders"` lists every encoder id this OBS has, comma
+/// separated. Never the key.
+pub extern "C" fn handle_portrait_out_status(_request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
+    ffi_guard(
+        "handle_portrait_out_status",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            let response = obs_data::from_void(response_data);
+            {
+                let guard = lock(&OUT);
+                match guard.as_ref() {
+                    None => obs_data::set_bool(response, "active", false),
+                    Some(out) => {
+                        let o = out.output;
+                        obs_data::set_bool(response, "active", obs_output_active().is_some_and(|f| f(o)));
+                        obs_data::set_int(response, "frames", obs_output_get_total_frames().map_or(-1, |f| f(o) as i64));
+                        obs_data::set_int(response, "dropped", obs_output_get_frames_dropped().map_or(-1, |f| f(o) as i64));
+                        obs_data::set_int(response, "bytes", obs_output_get_total_bytes().map_or(0, |f| f(o) as i64));
+                        let err = video_tap::obs_output_get_last_error().map_or(String::new(), |f| cstr(f(o)));
+                        obs_data::set_string(response, "last_error", &err);
+                        obs_data::set_string(response, "scene", &out.scene);
+                        obs_data::set_string(response, "video_encoder", &out.video_encoder);
+                        obs_data::set_int(response, "width", out.size.0 as i64);
+                        obs_data::set_int(response, "height", out.size.1 as i64);
+                    }
+                }
+            }
+            let mut ids = Vec::new();
+            if let Some(next) = obs_enum_encoder_types() {
+                let mut i = 0;
+                loop {
+                    let mut id: *const c_char = std::ptr::null();
+                    if !next(i, &mut id) {
+                        break;
+                    }
+                    ids.push(cstr(id));
+                    i += 1;
+                }
+            }
+            obs_data::set_string(response, "encoders", &ids.join(","));
+        }),
+    );
+}

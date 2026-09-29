@@ -148,11 +148,11 @@ const OBS_SCALE_BICUBIC: c_int = 2;
 const EVENT_SCENE_CHANGED: c_int = 8;
 const EVENT_TRANSITION_CHANGED: c_int = 10;
 const EVENT_SCENE_COLLECTION_CHANGED: c_int = 13;
-const EVENT_EXIT: c_int = 17;
+pub(crate) const EVENT_EXIT: c_int = 17;
 const EVENT_STUDIO_MODE_ENABLED: c_int = 22;
 const EVENT_STUDIO_MODE_DISABLED: c_int = 23;
 const EVENT_PREVIEW_SCENE_CHANGED: c_int = 24;
-const EVENT_SCENE_COLLECTION_CLEANUP: c_int = 25;
+pub(crate) const EVENT_SCENE_COLLECTION_CLEANUP: c_int = 25;
 
 const OUTPUT_TYPE_ID: &CStr = c"framesw_video_feed";
 
@@ -636,6 +636,16 @@ fn small_ovi(width: u32, height: u32) -> Result<ObsVideoInfo, String> {
         ovi.colorspace = VIDEO_CS_709;
     }
     ovi.scale_type = OBS_SCALE_BICUBIC;
+    Ok(ovi)
+}
+
+/// The portrait output's mix (`portrait_out.rs`, MULTISTREAM_PLAN.md Phase 0).
+/// Unlike `small_ovi`, the BASE size is the portrait frame too: its scene is
+/// laid out in portrait coordinates, not the canvas's.
+pub(crate) fn portrait_ovi(width: u32, height: u32) -> Result<ObsVideoInfo, String> {
+    let mut ovi = small_ovi(width, height)?;
+    ovi.base_width = width;
+    ovi.base_height = height;
     Ok(ovi)
 }
 

@@ -53,6 +53,7 @@ use std::sync::atomic::Ordering;
 mod audio_tap;
 mod input_probe;
 mod ndi_ffi;
+mod portrait_out;
 mod shm_ring;
 mod video_tap;
 
@@ -2285,6 +2286,9 @@ pub extern "C" fn obs_module_post_load() {
             ("start_video_feed", video_tap::handle_start_video_feed as calldata::RequestCallbackFn),
             ("stop_video_feed", video_tap::handle_stop_video_feed as calldata::RequestCallbackFn),
             ("video_feed_status", video_tap::handle_video_feed_status as calldata::RequestCallbackFn),
+            ("start_portrait_out", portrait_out::handle_start_portrait_out as calldata::RequestCallbackFn),
+            ("stop_portrait_out", portrait_out::handle_stop_portrait_out as calldata::RequestCallbackFn),
+            ("portrait_out_status", portrait_out::handle_portrait_out_status as calldata::RequestCallbackFn),
         ]
         .into_iter()
         .chain(input_probe::requests())
@@ -2328,6 +2332,9 @@ pub extern "C" fn obs_module_unload() {
         // an exit that never emitted it. Frontend callbacks are already
         // gone by now, so this touches only libobs (video_tap.rs doc).
         video_tap::stop_all();
+        // Likewise the portrait output (portrait_out.rs), without touching
+        // the frontend's callbacks.
+        portrait_out::stop_output();
         log_line("unloaded — background threads stopped cleanly");
     })
 }
