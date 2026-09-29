@@ -55,7 +55,8 @@ use std::sync::{Mutex, PoisonError};
 use crate::log_line;
 use crate::video_tap::{self, ObsViewT, VideoT, EVENT_EXIT, EVENT_SCENE_COLLECTION_CLEANUP};
 use studio_mode_meters_core::metering::{
-    ffi_guard, obs_get_source_by_name, obs_queue_task, obs_source_release, ObsOutputT, ObsSourceT, OBS_TASK_UI,
+    ffi_guard, frontend_scene_name, obs_frontend_get_current_scene, obs_get_source_by_name, obs_queue_task,
+    obs_source_create_private, obs_source_release, ObsOutputT, ObsSourceT, OBS_TASK_UI,
 };
 use studio_mode_meters_core::obs_data::{self, ObsDataT};
 
@@ -89,11 +90,50 @@ studio_mode_meters_core::resolved_fn!(obs_output_get_frames_dropped: extern "C" 
 studio_mode_meters_core::resolved_fn!(obs_output_get_total_frames: extern "C" fn(*const ObsOutputT) -> c_int);
 studio_mode_meters_core::resolved_fn!(obs_enum_encoder_types: extern "C" fn(usize, *mut *const c_char) -> bool);
 
+// Following OBS's Program (MULTISTREAM_PLAN.md §5). Checked against
+// obs-studio 32.2.2, fetched with curl on 2026-09-29: `libobs/obs.h`
+// (`obs_source_get_id` 1179, `enum obs_transition_mode` 1586,
+// `obs_transition_start` 1591, `obs_transition_set` 1594) and
+// `frontend/api/obs-frontend-api.h` (`enum obs_frontend_event` 16,
+// `obs_frontend_get_current_transition` 128,
+// `obs_frontend_get_transition_duration` 130).
+studio_mode_meters_core::resolved_fn!(obs_source_get_id: extern "C" fn(*const ObsSourceT) -> *const c_char);
+studio_mode_meters_core::resolved_fn!(obs_transition_set: extern "C" fn(*mut ObsSourceT, *mut ObsSourceT));
+// `enum obs_transition_mode mode`: an int.
+studio_mode_meters_core::resolved_fn!(
+    obs_transition_start: extern "C" fn(*mut ObsSourceT, c_int, u32, *mut ObsSourceT) -> bool
+);
+studio_mode_meters_core::resolved_fn!(obs_frontend_get_current_transition: extern "C" fn() -> *mut ObsSourceT);
+studio_mode_meters_core::resolved_fn!(obs_frontend_get_transition_duration: extern "C" fn() -> c_int);
+
+// enum obs_transition_mode: AUTO, MANUAL.
+const OBS_TRANSITION_MODE_AUTO: c_int = 0;
+// enum obs_frontend_event, by position (`video_tap.rs` keeps the others).
+const EVENT_SCENE_CHANGED: c_int = 8;
+const EVENT_TRANSITION_CHANGED: c_int = 10;
+const EVENT_TRANSITION_STOPPED: c_int = 11;
+
+/// The portrait twin of one of FrameSW's Program scenes. The names are
+/// FrameSW's (`ProgramSlot::portrait_scene_name` in the app): the two must
+/// stay the same.
+fn portrait_twin(program: &str) -> Option<&'static str> {
+    match program {
+        "FrameSW A" => Some("FrameSW A · Portrait"),
+        "FrameSW B" => Some("FrameSW B · Portrait"),
+        _ => None,
+    }
+}
+
 /// The running portrait output. Its pointers are libobs objects this
 /// plugin holds a reference to, touched only on OBS's UI thread (start,
 /// stop) or through libobs's thread-safe getters (status).
 struct Out {
     view: *mut ObsViewT,
+    /// Following OBS's Program: the view's source is this transition, a
+    /// private one of the same kind as OBS's, which cuts to each Program
+    /// scene's portrait twin as OBS cuts to the scene. Null otherwise.
+    transition: *mut ObsSourceT,
+    follow: bool,
     video_enc: *mut ObsEncoderT,
     audio_enc: *mut ObsEncoderT,
     service: *mut ObsServiceT,
@@ -129,6 +169,8 @@ fn release_source(source: *mut ObsSourceT) {
 }
 
 struct Start {
+    /// Ignored when following: the Program's portrait twin is shown.
+    follow: bool,
     scene: String,
     server: String,
     key: String,
@@ -170,6 +212,8 @@ fn start(req: &Start) -> Result<(), String> {
     }
     let mut out = Out {
         view: std::ptr::null_mut(),
+        transition: std::ptr::null_mut(),
+        follow: req.follow,
         video_enc: std::ptr::null_mut(),
         audio_enc: std::ptr::null_mut(),
         service: std::ptr::null_mut(),
@@ -182,8 +226,14 @@ fn start(req: &Start) -> Result<(), String> {
         Ok(()) => {
             // The server only: the key is never logged.
             log_line(&format!(
-                "portrait output started: scene '{}', {}x{}, {} at {} kbps, to {}",
-                req.scene, req.width, req.height, req.video_encoder, req.bitrate, req.server
+                "portrait output started: scene '{}'{}, {}x{}, {} at {} kbps, to {}",
+                out.scene,
+                if req.follow { ", following Program" } else { "" },
+                req.width,
+                req.height,
+                req.video_encoder,
+                req.bitrate,
+                req.server
             ));
             *lock(&OUT) = Some(out);
             register_event_callback();
@@ -207,17 +257,41 @@ fn build(out: &mut Out, req: &Start) -> Result<(), String> {
     else {
         return Err("obs_view_* unavailable".into());
     };
-    let cscene = CString::new(req.scene.as_str()).map_err(|e| e.to_string())?;
+    if out.follow {
+        let program = frontend_scene_name(obs_frontend_get_current_scene()).unwrap_or_default();
+        let twin = portrait_twin(&program).ok_or(format!("OBS's Program ('{program}') isn't one of FrameSW's scenes"))?;
+        out.scene = twin.to_string();
+    }
+    let cscene = CString::new(out.scene.as_str()).map_err(|e| e.to_string())?;
     let scene = get_source(cscene.as_ptr());
     if scene.is_null() {
-        return Err(format!("no scene named '{}'", req.scene));
+        return Err(format!("no scene named '{}'", out.scene));
     }
     out.view = view_create();
     if out.view.is_null() {
         release_source(scene);
         return Err("obs_view_create returned null".into());
     }
-    set_source(out.view, 0, scene);
+    if out.follow {
+        // Through a transition, so a TAKE is followed the way OBS makes it.
+        let Some(set) = obs_transition_set() else {
+            release_source(scene);
+            return Err("obs_transition_set unavailable".into());
+        };
+        match new_transition() {
+            Ok(t) => {
+                out.transition = t;
+                set(t, scene);
+                set_source(out.view, 0, t);
+            }
+            Err(e) => {
+                release_source(scene);
+                return Err(e);
+            }
+        }
+    } else {
+        set_source(out.view, 0, scene);
+    }
     release_source(scene);
     let mut ovi = video_tap::portrait_ovi(req.width, req.height)?;
     let video = add2(out.view, &mut ovi);
@@ -333,6 +407,97 @@ fn teardown(out: Out) {
             destroy(out.view);
         }
     }
+    // After the view has let go of it.
+    release_source(out.transition);
+}
+
+/// A private transition of the kind OBS is using now (a fade when OBS
+/// can't say), for the portrait view.
+fn new_transition() -> Result<*mut ObsSourceT, String> {
+    let id = obs_frontend_get_current_transition()
+        .map(|get| get())
+        .filter(|t| !t.is_null())
+        .map(|t| {
+            let id = obs_source_get_id().map_or(String::new(), |f| cstr(f(t)));
+            release_source(t);
+            id
+        })
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "fade_transition".to_string());
+    let create = obs_source_create_private().ok_or("obs_source_create_private unavailable")?;
+    let cid = CString::new(id.as_str()).map_err(|e| e.to_string())?;
+    let t = create(cid.as_ptr(), c"FrameSW portrait transition".as_ptr(), std::ptr::null_mut());
+    if t.is_null() {
+        return Err(format!("the '{id}' transition couldn't be created"));
+    }
+    Ok(t)
+}
+
+/// OBS's Program changed: the portrait view goes to its twin, with the
+/// transition and duration OBS is using. From OBS's scene-changed event,
+/// which it sends as it starts the main transition (MULTISTREAM_PLAN.md
+/// §5: FrameSW sends no second TAKE, so a TAKE from anywhere is followed).
+/// A scene that isn't FrameSW's leaves the portrait where it is.
+fn follow_program() {
+    let mut guard = lock(&OUT);
+    let Some(out) = guard.as_mut().filter(|o| o.follow && !o.transition.is_null()) else { return };
+    let Some(program) = frontend_scene_name(obs_frontend_get_current_scene()) else { return };
+    let Some(twin) = portrait_twin(&program) else { return };
+    if twin == out.scene {
+        return;
+    }
+    let (Some(get_source), Some(start), Some(set)) = (obs_get_source_by_name(), obs_transition_start(), obs_transition_set())
+    else {
+        return;
+    };
+    let Ok(ctwin) = CString::new(twin) else { return };
+    let dest = get_source(ctwin.as_ptr());
+    if dest.is_null() {
+        log_line(&format!("portrait output: no scene named '{twin}' to follow Program to"));
+        return;
+    }
+    let duration = obs_frontend_get_transition_duration().map_or(300, |f| f().max(0) as u32);
+    // One already running refuses a second: cut instead.
+    let eased = start(out.transition, OBS_TRANSITION_MODE_AUTO, duration, dest);
+    if !eased {
+        set(out.transition, dest);
+    }
+    release_source(dest);
+    log_line(&format!(
+        "portrait output follows Program to '{twin}' ({})",
+        if eased { format!("{duration} ms") } else { "cut: a transition was running".to_string() }
+    ));
+    out.scene = twin.to_string();
+}
+
+/// OBS's transition was changed (Fade to Cut, say): the portrait's becomes
+/// the same kind, showing what it showed.
+fn match_transition() {
+    let mut guard = lock(&OUT);
+    let Some(out) = guard.as_mut().filter(|o| o.follow && !o.transition.is_null()) else { return };
+    let have = obs_source_get_id().map_or(String::new(), |f| cstr(f(out.transition)));
+    let Ok(next) = new_transition() else { return };
+    let want = obs_source_get_id().map_or(String::new(), |f| cstr(f(next)));
+    let (Some(get_source), Some(set), Some(set_source)) =
+        (obs_get_source_by_name(), obs_transition_set(), video_tap::obs_view_set_source())
+    else {
+        release_source(next);
+        return;
+    };
+    if want == have {
+        release_source(next);
+        return;
+    }
+    let Ok(cscene) = CString::new(out.scene.as_str()) else {
+        release_source(next);
+        return;
+    };
+    let scene = get_source(cscene.as_ptr());
+    set(next, scene);
+    release_source(scene);
+    set_source(out.view, 0, next);
+    release_source(std::mem::replace(&mut out.transition, next));
+    log_line(&format!("portrait output's transition is now '{want}', as OBS's"));
 }
 
 /// Stops the portrait output, if there is one, and stops listening for
@@ -391,8 +556,18 @@ extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
         std::panic::AssertUnwindSafe(|| {
             // The view holds the scene: it lets go before the collection
             // is torn down, and the output stops before OBS does.
-            if event == EVENT_EXIT || event == EVENT_SCENE_COLLECTION_CLEANUP {
-                stop_all();
+            match event {
+                EVENT_EXIT | EVENT_SCENE_COLLECTION_CLEANUP => stop_all(),
+                EVENT_SCENE_CHANGED => follow_program(),
+                EVENT_TRANSITION_CHANGED => match_transition(),
+                // With the "follows Program" line above, how far apart the
+                // two transitions ran (MULTISTREAM_PLAN.md §5: measure).
+                EVENT_TRANSITION_STOPPED => {
+                    if lock(&OUT).as_ref().is_some_and(|o| o.follow) {
+                        log_line("portrait output: OBS's transition finished");
+                    }
+                }
+                _ => {}
             }
         }),
     );
@@ -439,10 +614,11 @@ fn run_on_ui(request: Option<Start>) -> Result<(), String> {
     call.result
 }
 
-/// Request: `{"scene", "server", "key"}` required; `"video_encoder"`,
-/// `"audio_encoder"`, `"bitrate"` (kbps, 6000), `"width"` (1080) and
-/// `"height"` (1920) optional. Response: `{"ok": true}` or `{"ok": false,
-/// "error": "..."}`.
+/// Request: `{"server", "key"}` required, and `"scene"` unless
+/// `"follow_program": true`, which shows OBS's Program's portrait twin and
+/// follows every TAKE; `"video_encoder"`, `"audio_encoder"`, `"bitrate"`
+/// (kbps, 6000), `"width"` (1080) and `"height"` (1920) optional. Response:
+/// `{"ok": true}` or `{"ok": false, "error": "..."}`.
 pub extern "C" fn handle_start_portrait_out(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
     ffi_guard(
         "handle_start_portrait_out",
@@ -451,12 +627,15 @@ pub extern "C" fn handle_start_portrait_out(request_data: *mut c_void, response_
             let request = obs_data::from_void(request_data);
             let response = obs_data::from_void(response_data);
             let text = |key: &str| obs_data::get_string(request, key).filter(|s| !s.is_empty());
-            let (Some(scene), Some(server), Some(key)) = (text("scene"), text("server"), text("key")) else {
+            let follow = obs_data::get_optional_bool(request, "follow_program").unwrap_or(false);
+            let scene = text("scene").or_else(|| follow.then(String::new));
+            let (Some(scene), Some(server), Some(key)) = (scene, text("server"), text("key")) else {
                 obs_data::set_bool(response, "ok", false);
-                obs_data::set_string(response, "error", "scene, server and key are required");
+                obs_data::set_string(response, "error", "server and key are required, and scene unless following Program");
                 return;
             };
             let req = Start {
+                follow,
                 scene,
                 server,
                 key,
@@ -518,6 +697,7 @@ pub extern "C" fn handle_portrait_out_status(_request_data: *mut c_void, respons
                         let err = video_tap::obs_output_get_last_error().map_or(String::new(), |f| cstr(f(o)));
                         obs_data::set_string(response, "last_error", &err);
                         obs_data::set_string(response, "scene", &out.scene);
+                        obs_data::set_bool(response, "follow_program", out.follow);
                         obs_data::set_string(response, "video_encoder", &out.video_encoder);
                         obs_data::set_int(response, "width", out.size.0 as i64);
                         obs_data::set_int(response, "height", out.size.1 as i64);
