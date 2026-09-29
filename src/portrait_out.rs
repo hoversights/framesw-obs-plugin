@@ -128,6 +128,9 @@ fn portrait_twin(program: &str) -> Option<&'static str> {
 /// plugin holds a reference to, touched only on OBS's UI thread (start,
 /// stop) or through libobs's thread-safe getters (status).
 struct Out {
+    /// Which output: "portrait" for the show's portrait stream, others for
+    /// FrameSW's test streams (one landscape, one portrait at once).
+    id: String,
     view: *mut ObsViewT,
     /// Following OBS's Program: the view's source is this transition, a
     /// private one of the same kind as OBS's, which cuts to each Program
@@ -147,7 +150,8 @@ struct Out {
 // threads; every mutation here runs on OBS's UI thread (`run_on_ui`).
 unsafe impl Send for Out {}
 
-static OUT: Mutex<Option<Out>> = Mutex::new(None);
+/// The outputs running now, each by its id.
+static OUTS: Mutex<Vec<Out>> = Mutex::new(Vec::new());
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -169,6 +173,7 @@ fn release_source(source: *mut ObsSourceT) {
 }
 
 struct Start {
+    id: String,
     /// Ignored when following: the Program's portrait twin is shown.
     follow: bool,
     scene: String,
@@ -207,10 +212,11 @@ fn new_data() -> Result<*mut ObsDataT, String> {
 }
 
 fn start(req: &Start) -> Result<(), String> {
-    if lock(&OUT).is_some() {
-        return Err("a portrait output is already running".into());
+    if lock(&OUTS).iter().any(|o| o.id == req.id) {
+        return Err(format!("the output '{}' is already running", req.id));
     }
     let mut out = Out {
+        id: req.id.clone(),
         view: std::ptr::null_mut(),
         transition: std::ptr::null_mut(),
         follow: req.follow,
@@ -226,7 +232,8 @@ fn start(req: &Start) -> Result<(), String> {
         Ok(()) => {
             // The server only: the key is never logged.
             log_line(&format!(
-                "portrait output started: scene '{}'{}, {}x{}, {} at {} kbps, to {}",
+                "output '{}' started: scene '{}'{}, {}x{}, {} at {} kbps, to {}",
+                out.id,
                 out.scene,
                 if req.follow { ", following Program" } else { "" },
                 req.width,
@@ -235,12 +242,12 @@ fn start(req: &Start) -> Result<(), String> {
                 req.bitrate,
                 req.server
             ));
-            *lock(&OUT) = Some(out);
+            lock(&OUTS).push(out);
             register_event_callback();
             Ok(())
         }
         Err(e) => {
-            log_line(&format!("portrait output failed to start: {e}"));
+            log_line(&format!("output '{}' failed to start: {e}", req.id));
             teardown(out);
             Err(e)
         }
@@ -439,10 +446,14 @@ fn new_transition() -> Result<*mut ObsSourceT, String> {
 /// §5: FrameSW sends no second TAKE, so a TAKE from anywhere is followed).
 /// A scene that isn't FrameSW's leaves the portrait where it is.
 fn follow_program() {
-    let mut guard = lock(&OUT);
-    let Some(out) = guard.as_mut().filter(|o| o.follow && !o.transition.is_null()) else { return };
     let Some(program) = frontend_scene_name(obs_frontend_get_current_scene()) else { return };
     let Some(twin) = portrait_twin(&program) else { return };
+    for out in lock(&OUTS).iter_mut().filter(|o| o.follow && !o.transition.is_null()) {
+        follow_to(out, twin);
+    }
+}
+
+fn follow_to(out: &mut Out, twin: &'static str) {
     if twin == out.scene {
         return;
     }
@@ -453,7 +464,7 @@ fn follow_program() {
     let Ok(ctwin) = CString::new(twin) else { return };
     let dest = get_source(ctwin.as_ptr());
     if dest.is_null() {
-        log_line(&format!("portrait output: no scene named '{twin}' to follow Program to"));
+        log_line(&format!("output '{}': no scene named '{twin}' to follow Program to", out.id));
         return;
     }
     let duration = obs_frontend_get_transition_duration().map_or(300, |f| f().max(0) as u32);
@@ -464,7 +475,8 @@ fn follow_program() {
     }
     release_source(dest);
     log_line(&format!(
-        "portrait output follows Program to '{twin}' ({})",
+        "output '{}' follows Program to '{twin}' ({})",
+        out.id,
         if eased { format!("{duration} ms") } else { "cut: a transition was running".to_string() }
     ));
     out.scene = twin.to_string();
@@ -473,8 +485,12 @@ fn follow_program() {
 /// OBS's transition was changed (Fade to Cut, say): the portrait's becomes
 /// the same kind, showing what it showed.
 fn match_transition() {
-    let mut guard = lock(&OUT);
-    let Some(out) = guard.as_mut().filter(|o| o.follow && !o.transition.is_null()) else { return };
+    for out in lock(&OUTS).iter_mut().filter(|o| o.follow && !o.transition.is_null()) {
+        match_transition_of(out);
+    }
+}
+
+fn match_transition_of(out: &mut Out) {
     let have = obs_source_get_id().map_or(String::new(), |f| cstr(f(out.transition)));
     let Ok(next) = new_transition() else { return };
     let want = obs_source_get_id().map_or(String::new(), |f| cstr(f(next)));
@@ -497,24 +513,42 @@ fn match_transition() {
     release_source(scene);
     set_source(out.view, 0, next);
     release_source(std::mem::replace(&mut out.transition, next));
-    log_line(&format!("portrait output's transition is now '{want}', as OBS's"));
+    log_line(&format!("output '{}' transition is now '{want}', as OBS's", out.id));
 }
 
-/// Stops the portrait output, if there is one, and stops listening for
-/// OBS's events. On OBS's UI thread.
+/// Stops every output and stops listening for OBS's events. On OBS's UI
+/// thread.
 pub fn stop_all() {
     stop_output();
     unregister_event_callback();
 }
 
-/// The output only: for module unload, when the frontend's callbacks are
+/// Stops one output; the events go when the last does. On OBS's UI thread.
+fn stop_id(id: &str) {
+    let found = {
+        let mut outs = lock(&OUTS);
+        outs.iter().position(|o| o.id == id).map(|i| outs.remove(i))
+    };
+    if let Some(out) = found {
+        stop_one(out);
+    }
+    if lock(&OUTS).is_empty() {
+        unregister_event_callback();
+    }
+}
+
+fn stop_one(out: Out) {
+    let (id, scene) = (out.id.clone(), out.scene.clone());
+    teardown(out);
+    log_line(&format!("output '{id}' stopped (scene '{scene}')"));
+}
+
+/// Every output only: for module unload, when the frontend's callbacks are
 /// already gone and must not be touched (lib.rs, `obs_module_unload`).
 pub fn stop_output() {
-    let out = lock(&OUT).take();
-    if let Some(out) = out {
-        let scene = out.scene.clone();
-        teardown(out);
-        log_line(&format!("portrait output stopped (scene '{scene}')"));
+    let outs = std::mem::take(&mut *lock(&OUTS));
+    for out in outs {
+        stop_one(out);
     }
 }
 
@@ -563,7 +597,7 @@ extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
                 // With the "follows Program" line above, how far apart the
                 // two transitions ran (MULTISTREAM_PLAN.md §5: measure).
                 EVENT_TRANSITION_STOPPED => {
-                    if lock(&OUT).as_ref().is_some_and(|o| o.follow) {
+                    if lock(&OUTS).iter().any(|o| o.follow) {
                         log_line("portrait output: OBS's transition finished");
                     }
                 }
@@ -579,8 +613,13 @@ extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
 
 struct UiCall {
     ran: bool,
-    request: Option<Start>, // None = stop
+    request: UiRequest,
     result: Result<(), String>,
+}
+
+enum UiRequest {
+    Start(Start),
+    Stop(String),
 }
 
 extern "C" fn run_on_ui_thread(param: *mut c_void) {
@@ -594,9 +633,9 @@ extern "C" fn run_on_ui_thread(param: *mut c_void) {
             let call = unsafe { &mut *param.cast::<UiCall>() };
             call.ran = true;
             call.result = match &call.request {
-                Some(req) => start(req),
-                None => {
-                    stop_all();
+                UiRequest::Start(req) => start(req),
+                UiRequest::Stop(id) => {
+                    stop_id(id);
                     Ok(())
                 }
             };
@@ -604,7 +643,7 @@ extern "C" fn run_on_ui_thread(param: *mut c_void) {
     );
 }
 
-fn run_on_ui(request: Option<Start>) -> Result<(), String> {
+fn run_on_ui(request: UiRequest) -> Result<(), String> {
     let queue = obs_queue_task().ok_or("obs_queue_task unavailable")?;
     let mut call = UiCall { ran: false, request, result: Ok(()) };
     queue(OBS_TASK_UI, run_on_ui_thread, (&mut call as *mut UiCall).cast(), true);
@@ -616,9 +655,11 @@ fn run_on_ui(request: Option<Start>) -> Result<(), String> {
 
 /// Request: `{"server", "key"}` required, and `"scene"` unless
 /// `"follow_program": true`, which shows OBS's Program's portrait twin and
-/// follows every TAKE; `"video_encoder"`, `"audio_encoder"`, `"bitrate"`
-/// (kbps, 6000), `"width"` (1080) and `"height"` (1920) optional. Response:
-/// `{"ok": true}` or `{"ok": false, "error": "..."}`.
+/// follows every TAKE; `"id"` ("portrait": the show's portrait stream;
+/// FrameSW's test streams use their own), `"video_encoder"`,
+/// `"audio_encoder"`, `"bitrate"` (kbps, 6000), `"width"` (1080) and
+/// `"height"` (1920) optional. Several may run at once, one per id.
+/// Response: `{"ok": true}` or `{"ok": false, "error": "..."}`.
 pub extern "C" fn handle_start_portrait_out(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
     ffi_guard(
         "handle_start_portrait_out",
@@ -635,6 +676,7 @@ pub extern "C" fn handle_start_portrait_out(request_data: *mut c_void, response_
                 return;
             };
             let req = Start {
+                id: text("id").unwrap_or_else(|| "portrait".to_string()),
                 follow,
                 scene,
                 server,
@@ -645,7 +687,7 @@ pub extern "C" fn handle_start_portrait_out(request_data: *mut c_void, response_
                 width: obs_data::get_optional_int(request, "width").filter(|w| *w > 0).unwrap_or(1080) as u32,
                 height: obs_data::get_optional_int(request, "height").filter(|h| *h > 0).unwrap_or(1920) as u32,
             };
-            match run_on_ui(Some(req)) {
+            match run_on_ui(UiRequest::Start(req)) {
                 Ok(()) => obs_data::set_bool(response, "ok", true),
                 Err(e) => {
                     obs_data::set_bool(response, "ok", false);
@@ -656,14 +698,16 @@ pub extern "C" fn handle_start_portrait_out(request_data: *mut c_void, response_
     );
 }
 
-/// Request: `{}`. Response: `{"ok": true}`.
-pub extern "C" fn handle_stop_portrait_out(_request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
+/// Request: `{"id"}` ("portrait" when left out). Response: `{"ok": true}`.
+pub extern "C" fn handle_stop_portrait_out(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
     ffi_guard(
         "handle_stop_portrait_out",
         (),
         std::panic::AssertUnwindSafe(|| {
+            let request = obs_data::from_void(request_data);
             let response = obs_data::from_void(response_data);
-            match run_on_ui(None) {
+            let id = obs_data::get_string(request, "id").filter(|s| !s.is_empty()).unwrap_or_else(|| "portrait".into());
+            match run_on_ui(UiRequest::Stop(id)) {
                 Ok(()) => obs_data::set_bool(response, "ok", true),
                 Err(e) => {
                     obs_data::set_bool(response, "ok", false);
@@ -674,19 +718,21 @@ pub extern "C" fn handle_stop_portrait_out(_request_data: *mut c_void, response_
     );
 }
 
-/// Request: `{}`. Response: `{"active", "frames", "dropped", "bytes",
-/// "last_error", "scene", "video_encoder", "width", "height",
-/// "encoders"}`; `"encoders"` lists every encoder id this OBS has, comma
-/// separated. Never the key.
-pub extern "C" fn handle_portrait_out_status(_request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
+/// Request: `{"id"}` ("portrait" when left out). Response: `{"active",
+/// "frames", "dropped", "bytes", "last_error", "scene", "video_encoder",
+/// "width", "height", "encoders"}`; `"encoders"` lists every encoder id this
+/// OBS has, comma separated. Never the key.
+pub extern "C" fn handle_portrait_out_status(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
     ffi_guard(
         "handle_portrait_out_status",
         (),
         std::panic::AssertUnwindSafe(|| {
+            let request = obs_data::from_void(request_data);
             let response = obs_data::from_void(response_data);
+            let id = obs_data::get_string(request, "id").filter(|s| !s.is_empty()).unwrap_or_else(|| "portrait".into());
             {
-                let guard = lock(&OUT);
-                match guard.as_ref() {
+                let guard = lock(&OUTS);
+                match guard.iter().find(|o| o.id == id) {
                     None => obs_data::set_bool(response, "active", false),
                     Some(out) => {
                         let o = out.output;
