@@ -3,7 +3,7 @@ members = ["crates/core"]
 
 [package]
 name = "framesw-obs-plugin"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 publish = false
 # GPL-2.0-or-later, matching OBS Studio's own licence. This plugin is loaded

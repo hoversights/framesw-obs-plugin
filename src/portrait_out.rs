@@ -16,9 +16,12 @@
 // You should have received a copy of the GNU General Public License along
 // with this program; if not, see <https://www.gnu.org/licenses/>.
 
-//! SPIKE (FrameSW MULTISTREAM_PLAN.md, Phase 0): a portrait picture of one
+//! Portrait streams (FrameSW MULTISTREAM_PLAN.md): a portrait picture of one
 //! scene, encoded on its own and sent over RTMP beside OBS's own stream.
-//! Built to be measured, not shipped.
+//! Several at once, one per id: FrameSW's show stream ("portrait") and its
+//! per-site test streams. Started as the Phase 0 spike, and measured before
+//! it was kept: live to YouTube's dual-format event on 2026-09-29, following
+//! every TAKE, 0 frames dropped.
 //!
 //! Every new declaration was checked against obs-studio **32.2.2** (the
 //! installed OBS), fetched with curl on 2026-09-29: `libobs/obs.h`
@@ -39,9 +42,8 @@
 //! - `obs_encoder_set_video` refuses once the encoder is active or
 //!   initialised, so it is set before the output starts.
 //! - Unlike the monitor feeds (`video_tap.rs`), the view's BASE size is the
-//!   portrait frame, so a scene laid out in portrait coordinates fills it.
-//!   Whether a scene renders unclipped past the canvas's own size is what
-//!   this spike measures.
+//!   portrait frame, so a scene laid out in portrait coordinates fills it,
+//!   unclipped past the canvas's own size (measured, Phase 0).
 //! - Teardown order: the output (its release stops it and joins), then the
 //!   encoders and the service, then the view, with `obs_view_remove`
 //!   before `obs_view_destroy` (`video_tap.rs`'s header).

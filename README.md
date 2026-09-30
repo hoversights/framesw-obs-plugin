@@ -54,9 +54,9 @@ The plugin registers as obs-websocket vendor `framesw` and exposes 15
 requests. Any obs-websocket client can call them; they are not private to
 FrameSW.
 
-**Four of them change your OBS.** They are listed first and marked, because
-if you install this from a plugin directory you should know that before you
-do, not after.
+**Four of them change your OBS, and three more stream from it.** They are
+listed first and marked, because if you install this from a plugin directory
+you should know that before you do, not after.
 
 ### Requests that modify OBS state
 
@@ -66,6 +66,20 @@ do, not after.
 | `ensure_profile` | Creates an OBS **Profile** if missing and switches to it. Runs on OBS's UI thread deliberately: doing this over obs-websocket's pooled thread raced `config_save_safe` and left a half-written `basic.ini`. |
 | `projector_on_top` | Toggles OBS's "projectors always on top" setting, which lives in `user.ini`. Exposed here because obs-websocket has no request for it and the file cannot be safely edited on disk while OBS is running. |
 | `ndi_outputs` | Reads and sets DistroAV's Main/Preview NDI output switches, also in `user.ini`, for the same reason. No effect if DistroAV is not installed. |
+
+### Requests that stream
+
+These **send a stream over the network**, beside OBS's own: a second
+picture laid out for a phone (1080×1920 unless asked otherwise), encoded on
+its own and pushed to an RTMP server. They don't change OBS's settings, its
+scenes or its own stream. The stream key goes into the stream's service and
+nowhere else: never logged, never returned.
+
+| Request | What it does |
+|---|---|
+| `start_portrait_out` | Starts a portrait stream to `server` with `key`, of a named `scene`, or with `follow_program` of `FrameSW A · Portrait` / `FrameSW B · Portrait` as FrameSW's Program changes, through a transition of OBS's own kind. Several run at once, one per `id`. |
+| `stop_portrait_out` | Stops the stream with that `id`. |
+| `portrait_out_status` | Whether it is live, frames sent and dropped, bytes sent, and its last error. Read-only. |
 
 ### Read-only requests
 
