@@ -2287,6 +2287,7 @@ pub extern "C" fn obs_module_post_load() {
             ("stop_video_feed", video_tap::handle_stop_video_feed as calldata::RequestCallbackFn),
             ("video_feed_status", video_tap::handle_video_feed_status as calldata::RequestCallbackFn),
             ("start_portrait_out", portrait_out::handle_start_portrait_out as calldata::RequestCallbackFn),
+            ("start_site_out", portrait_out::handle_start_site_out as calldata::RequestCallbackFn),
             ("stop_portrait_out", portrait_out::handle_stop_portrait_out as calldata::RequestCallbackFn),
             ("portrait_out_status", portrait_out::handle_portrait_out_status as calldata::RequestCallbackFn),
         ]

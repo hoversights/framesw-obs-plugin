@@ -78,8 +78,9 @@ nowhere else: never logged, never returned.
 | Request | What it does |
 |---|---|
 | `start_portrait_out` | Starts a portrait stream to `server` with `key`, of a named `scene`, or with `follow_program` of `FrameSW A · Portrait` / `FrameSW B · Portrait` as FrameSW's Program changes, through a transition of OBS's own kind. Several run at once, one per `id`. |
-| `stop_portrait_out` | Stops the stream with that `id`. |
-| `portrait_out_status` | Whether it is live, frames sent and dropped, bytes sent, and its last error. Read-only. |
+| `start_site_out` | One more site on encoders that are already running: `share` names a running portrait stream's `id`, or `obs` for OBS's own stream (which must be live). It has a connection of its own and no encoder, so it costs upload and no second encode. It stops with what it shares. |
+| `stop_portrait_out` | Stops the stream or the site with that `id`. |
+| `portrait_out_status` | Whether it is live or reconnecting, frames sent and dropped, bytes sent, and its last error. Read-only. |
 
 ### Read-only requests
 

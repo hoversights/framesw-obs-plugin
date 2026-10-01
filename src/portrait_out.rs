@@ -19,7 +19,8 @@
 //! Portrait streams (FrameSW MULTISTREAM_PLAN.md): a portrait picture of one
 //! scene, encoded on its own and sent over RTMP beside OBS's own stream.
 //! Several at once, one per id: FrameSW's show stream ("portrait") and its
-//! per-site test streams. Started as the Phase 0 spike, and measured before
+//! per-site test streams. More sites join a stream that is already running
+//! as sends (`SiteSend`): a connection each, on the same encoders. Started as the Phase 0 spike, and measured before
 //! it was kept: live to YouTube's dual-format event on 2026-09-29, following
 //! every TAKE, 0 frames dropped.
 //!
@@ -108,9 +109,26 @@ studio_mode_meters_core::resolved_fn!(
 studio_mode_meters_core::resolved_fn!(obs_frontend_get_current_transition: extern "C" fn() -> *mut ObsSourceT);
 studio_mode_meters_core::resolved_fn!(obs_frontend_get_transition_duration: extern "C" fn() -> c_int);
 
+// More sites on encoders that are already running (MULTISTREAM_PLAN.md,
+// Phase 4). Checked against obs-studio 32.2.2, fetched with curl on
+// 2026-10-01: `libobs/obs.h` (`obs_output_get_video_encoder` 2040,
+// `obs_output_get_audio_encoder` 2058, `obs_output_set_reconnect_settings`
+// 2069, `obs_output_reconnecting` 2133), `frontend/api/obs-frontend-api.h`
+// (`obs_frontend_get_streaming_output` 204, a new reference), and
+// `libobs/obs-encoder.c` and `obs-output.c` for the facts below.
+studio_mode_meters_core::resolved_fn!(obs_output_get_video_encoder: extern "C" fn(*const ObsOutputT) -> *mut ObsEncoderT);
+studio_mode_meters_core::resolved_fn!(
+    obs_output_get_audio_encoder: extern "C" fn(*const ObsOutputT, usize) -> *mut ObsEncoderT
+);
+studio_mode_meters_core::resolved_fn!(obs_output_set_reconnect_settings: extern "C" fn(*mut ObsOutputT, c_int, c_int));
+studio_mode_meters_core::resolved_fn!(obs_output_reconnecting: extern "C" fn(*const ObsOutputT) -> bool);
+studio_mode_meters_core::resolved_fn!(obs_frontend_get_streaming_output: extern "C" fn() -> *mut ObsOutputT);
+
 // enum obs_transition_mode: AUTO, MANUAL.
 const OBS_TRANSITION_MODE_AUTO: c_int = 0;
 // enum obs_frontend_event, by position (`video_tap.rs` keeps the others).
+const EVENT_STREAMING_STOPPING: c_int = 2;
+const EVENT_STREAMING_STOPPED: c_int = 3;
 const EVENT_SCENE_CHANGED: c_int = 8;
 const EVENT_TRANSITION_CHANGED: c_int = 10;
 const EVENT_TRANSITION_STOPPED: c_int = 11;
@@ -155,6 +173,38 @@ unsafe impl Send for Out {}
 /// The outputs running now, each by its id.
 static OUTS: Mutex<Vec<Out>> = Mutex::new(Vec::new());
 
+/// Whose encoders a `SiteSend` shares: OBS's own stream's.
+const SHARE_OBS: &str = "obs";
+
+/// One more site on encoders that are already running: a connection of its
+/// own and nothing else, so it costs upload and no second encode. Facts
+/// from libobs 32.2.2 this rests on:
+/// - an encoder keeps a list of who it feeds: it starts with the first and
+///   stops with the last (`obs_encoder_start`, `obs_encoder_stop`), so a
+///   send can join and leave while the others carry on;
+/// - an output takes its own reference to each encoder it is given
+///   (`obs_output_set_video_encoder2`), so a send keeps them alive itself.
+///
+/// A send never outlives what it shares: it stops before its `Out` is torn
+/// down, and with OBS's own stream when it shares that.
+struct SiteSend {
+    id: String,
+    /// An `Out`'s id ("portrait"), or `SHARE_OBS`.
+    share: String,
+    service: *mut ObsServiceT,
+    output: *mut ObsOutputT,
+}
+
+// SAFETY: as `Out`.
+unsafe impl Send for SiteSend {}
+
+/// The sends running now, each by its id.
+static SENDS: Mutex<Vec<SiteSend>> = Mutex::new(Vec::new());
+
+/// What OBS itself uses for its stream: up to 25 tries, 2 seconds apart.
+const RECONNECT_TRIES: c_int = 25;
+const RECONNECT_WAIT_S: c_int = 2;
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -186,6 +236,13 @@ struct Start {
     bitrate: i64,
     width: u32,
     height: u32,
+}
+
+struct SendStart {
+    id: String,
+    share: String,
+    server: String,
+    key: String,
 }
 
 fn default_video_encoder() -> &'static str {
@@ -342,40 +399,154 @@ fn build(out: &mut Out, req: &Start) -> Result<(), String> {
     }
     set_audio(out.audio_enc, get_audio());
 
-    // Where it goes. The key lives in these settings and nowhere else.
+    connect(&mut out.service, &mut out.output, out.video_enc, out.audio_enc, "FrameSW portrait", &req.server, &req.key)
+}
+
+/// A connection to one site, on encoders that are set up: the service that
+/// holds the address and the key, and the RTMP output that sends. It tries
+/// again by itself if the site drops it. Leaves whatever it made in
+/// `service` and `output`, so the caller's teardown undoes exactly that on
+/// failure. The key lives in the service's settings and nowhere else.
+fn connect(
+    service: &mut *mut ObsServiceT,
+    output: &mut *mut ObsOutputT,
+    video_enc: *mut ObsEncoderT,
+    audio_enc: *mut ObsEncoderT,
+    name: &str,
+    server: &str,
+    key: &str,
+) -> Result<(), String> {
+    // OBS's own log names each connection by this.
+    let name = CString::new(name).map_err(|e| e.to_string())?;
     let service_create = obs_service_create_private().ok_or("obs_service_create_private unavailable")?;
     let settings = new_data()?;
-    obs_data::set_string(settings, "server", &req.server);
-    obs_data::set_string(settings, "key", &req.key);
-    out.service = service_create(c"rtmp_custom".as_ptr(), c"FrameSW portrait service".as_ptr(), settings);
+    obs_data::set_string(settings, "server", server);
+    obs_data::set_string(settings, "key", key);
+    *service = service_create(c"rtmp_custom".as_ptr(), name.as_ptr(), settings);
     obs_data::release(settings);
-    if out.service.is_null() {
+    if service.is_null() {
         return Err("the rtmp_custom service couldn't be created".into());
     }
 
-    // The output that sends it.
     let output_create = video_tap::obs_output_create().ok_or("obs_output_create unavailable")?;
     let set_venc = obs_output_set_video_encoder().ok_or("obs_output_set_video_encoder unavailable")?;
     let set_aenc = obs_output_set_audio_encoder().ok_or("obs_output_set_audio_encoder unavailable")?;
     let set_service = obs_output_set_service().ok_or("obs_output_set_service unavailable")?;
     let output_start = video_tap::obs_output_start().ok_or("obs_output_start unavailable")?;
-    out.output = output_create(
-        c"rtmp_output".as_ptr(),
-        c"FrameSW portrait".as_ptr(),
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-    );
-    if out.output.is_null() {
+    *output = output_create(c"rtmp_output".as_ptr(), name.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut());
+    if output.is_null() {
         return Err("the rtmp_output couldn't be created".into());
     }
-    set_venc(out.output, out.video_enc);
-    set_aenc(out.output, out.audio_enc, 0);
-    set_service(out.output, out.service);
-    if !output_start(out.output) {
-        let err = video_tap::obs_output_get_last_error().map_or(String::new(), |f| cstr(f(out.output)));
+    set_venc(*output, video_enc);
+    set_aenc(*output, audio_enc, 0);
+    set_service(*output, *service);
+    // Without it a dropped connection ends the stream for good.
+    if let Some(reconnect) = obs_output_set_reconnect_settings() {
+        reconnect(*output, RECONNECT_TRIES, RECONNECT_WAIT_S);
+    }
+    if !output_start(*output) {
+        let err = video_tap::obs_output_get_last_error().map_or(String::new(), |f| cstr(f(*output)));
         return Err(format!("obs_output_start failed: {err}"));
     }
     Ok(())
+}
+
+/// One more site on the encoders of `share`. On OBS's UI thread.
+fn start_send(req: &SendStart) -> Result<(), String> {
+    if lock(&OUTS).iter().any(|o| o.id == req.id) || lock(&SENDS).iter().any(|s| s.id == req.id) {
+        return Err(format!("the output '{}' is already running", req.id));
+    }
+    let (video_enc, audio_enc) = shared_encoders(&req.share)?;
+    let mut send = SiteSend {
+        id: req.id.clone(),
+        share: req.share.clone(),
+        service: std::ptr::null_mut(),
+        output: std::ptr::null_mut(),
+    };
+    let name = format!("FrameSW {}", req.id);
+    match connect(&mut send.service, &mut send.output, video_enc, audio_enc, &name, &req.server, &req.key) {
+        Ok(()) => {
+            // The server only: the key is never logged.
+            log_line(&format!("send '{}' started on the encoders of '{}', to {}", send.id, send.share, req.server));
+            lock(&SENDS).push(send);
+            register_event_callback();
+            Ok(())
+        }
+        Err(e) => {
+            log_line(&format!("send '{}' failed to start: {e}", req.id));
+            teardown_send(send);
+            Err(e)
+        }
+    }
+}
+
+/// The video and audio encoders a send joins: an `Out`'s, or those of OBS's
+/// own stream, which must be live (its encoders are only set up then).
+/// Borrowed: the send's output takes its own references.
+fn shared_encoders(share: &str) -> Result<(*mut ObsEncoderT, *mut ObsEncoderT), String> {
+    if share != SHARE_OBS {
+        let outs = lock(&OUTS);
+        let out = outs.iter().find(|o| o.id == share).ok_or_else(|| format!("the output '{share}' isn't running"))?;
+        return Ok((out.video_enc, out.audio_enc));
+    }
+    let streaming = obs_frontend_get_streaming_output().ok_or("obs_frontend_get_streaming_output unavailable")?;
+    let get_venc = obs_output_get_video_encoder().ok_or("obs_output_get_video_encoder unavailable")?;
+    let get_aenc = obs_output_get_audio_encoder().ok_or("obs_output_get_audio_encoder unavailable")?;
+    let active = obs_output_active().ok_or("obs_output_active unavailable")?;
+    let stream = streaming();
+    if stream.is_null() {
+        return Err("OBS has no stream output yet: start OBS's own stream first".into());
+    }
+    let found = if active(stream) {
+        let (v, a) = (get_venc(stream), get_aenc(stream, 0));
+        if v.is_null() || a.is_null() {
+            Err("OBS's stream has no encoders to share".to_string())
+        } else {
+            Ok((v, a))
+        }
+    } else {
+        Err("OBS's own stream isn't live: start it first".to_string())
+    };
+    // `obs_frontend_get_streaming_output` hands over a reference.
+    if let Some(release) = video_tap::obs_output_release() {
+        release(stream);
+    }
+    found
+}
+
+fn teardown_send(send: SiteSend) {
+    if !send.output.is_null() {
+        if obs_output_active().is_some_and(|active| active(send.output)) {
+            if let Some(stop) = video_tap::obs_output_stop() {
+                stop(send.output);
+            }
+        }
+        // As `teardown`: the release waits for the stop. It also gives
+        // back the output's references to the shared encoders.
+        if let Some(release) = video_tap::obs_output_release() {
+            release(send.output);
+        }
+    }
+    if !send.service.is_null() {
+        if let Some(release) = obs_service_release() {
+            release(send.service);
+        }
+    }
+}
+
+/// Stops every send on the encoders of `share`. On OBS's UI thread.
+fn stop_sends_of(share: &str) {
+    let gone: Vec<SiteSend> = {
+        let mut sends = lock(&SENDS);
+        let (gone, kept) = std::mem::take(&mut *sends).into_iter().partition(|s| s.share == share);
+        *sends = kept;
+        gone
+    };
+    for send in gone {
+        let id = send.id.clone();
+        teardown_send(send);
+        log_line(&format!("send '{id}' stopped with '{share}'"));
+    }
 }
 
 fn teardown(out: Out) {
@@ -534,13 +705,23 @@ fn stop_id(id: &str) {
     if let Some(out) = found {
         stop_one(out);
     }
-    if lock(&OUTS).is_empty() {
+    let found = {
+        let mut sends = lock(&SENDS);
+        sends.iter().position(|s| s.id == id).map(|i| sends.remove(i))
+    };
+    if let Some(send) = found {
+        teardown_send(send);
+        log_line(&format!("send '{id}' stopped"));
+    }
+    if lock(&OUTS).is_empty() && lock(&SENDS).is_empty() {
         unregister_event_callback();
     }
 }
 
 fn stop_one(out: Out) {
     let (id, scene) = (out.id.clone(), out.scene.clone());
+    // Its sends first: they run on its encoders and its picture.
+    stop_sends_of(&id);
     teardown(out);
     log_line(&format!("output '{id}' stopped (scene '{scene}')"));
 }
@@ -552,6 +733,8 @@ pub fn stop_output() {
     for out in outs {
         stop_one(out);
     }
+    // What is left shares OBS's own stream.
+    stop_sends_of(SHARE_OBS);
 }
 
 // ---------------------------------------------------------------------
@@ -594,6 +777,15 @@ extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
             // is torn down, and the output stops before OBS does.
             match event {
                 EVENT_EXIT | EVENT_SCENE_COLLECTION_CLEANUP => stop_all(),
+                // The sends on OBS's own encoders go with OBS's stream:
+                // left running, they would hold those encoders while OBS
+                // sets them up again for its next stream.
+                EVENT_STREAMING_STOPPING | EVENT_STREAMING_STOPPED => {
+                    stop_sends_of(SHARE_OBS);
+                    if lock(&OUTS).is_empty() && lock(&SENDS).is_empty() {
+                        unregister_event_callback();
+                    }
+                }
                 EVENT_SCENE_CHANGED => follow_program(),
                 EVENT_TRANSITION_CHANGED => match_transition(),
                 // With the "follows Program" line above, how far apart the
@@ -621,6 +813,7 @@ struct UiCall {
 
 enum UiRequest {
     Start(Start),
+    StartSend(SendStart),
     Stop(String),
 }
 
@@ -636,6 +829,7 @@ extern "C" fn run_on_ui_thread(param: *mut c_void) {
             call.ran = true;
             call.result = match &call.request {
                 UiRequest::Start(req) => start(req),
+                UiRequest::StartSend(req) => start_send(req),
                 UiRequest::Stop(id) => {
                     stop_id(id);
                     Ok(())
@@ -700,7 +894,40 @@ pub extern "C" fn handle_start_portrait_out(request_data: *mut c_void, response_
     );
 }
 
-/// Request: `{"id"}` ("portrait" when left out). Response: `{"ok": true}`.
+/// Request: `{"id", "share", "server", "key"}`, all required. One more site
+/// on encoders that are already running: `"share"` is the id of a running
+/// portrait output ("portrait"), or "obs" for OBS's own stream, which must
+/// be live. It has no picture or encoder of its own, stops with what it
+/// shares, and is stopped and read by its `id` with `stop_portrait_out` and
+/// `portrait_out_status`. Response: `{"ok": true}` or `{"ok": false,
+/// "error": "..."}`.
+pub extern "C" fn handle_start_site_out(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
+    ffi_guard(
+        "handle_start_site_out",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            let request = obs_data::from_void(request_data);
+            let response = obs_data::from_void(response_data);
+            let text = |key: &str| obs_data::get_string(request, key).filter(|s| !s.is_empty());
+            let (Some(id), Some(share), Some(server), Some(key)) = (text("id"), text("share"), text("server"), text("key"))
+            else {
+                obs_data::set_bool(response, "ok", false);
+                obs_data::set_string(response, "error", "id, share, server and key are required");
+                return;
+            };
+            match run_on_ui(UiRequest::StartSend(SendStart { id, share, server, key })) {
+                Ok(()) => obs_data::set_bool(response, "ok", true),
+                Err(e) => {
+                    obs_data::set_bool(response, "ok", false);
+                    obs_data::set_string(response, "error", &e);
+                }
+            }
+        }),
+    );
+}
+
+/// Request: `{"id"}` ("portrait" when left out), an output's or a send's.
+/// Response: `{"ok": true}`.
 pub extern "C" fn handle_stop_portrait_out(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
     ffi_guard(
         "handle_stop_portrait_out",
@@ -720,10 +947,12 @@ pub extern "C" fn handle_stop_portrait_out(request_data: *mut c_void, response_d
     );
 }
 
-/// Request: `{"id"}` ("portrait" when left out). Response: `{"active",
-/// "frames", "dropped", "bytes", "last_error", "scene", "video_encoder",
-/// "width", "height", "encoders"}`; `"encoders"` lists every encoder id this
-/// OBS has, comma separated. Never the key.
+/// Request: `{"id"}` ("portrait" when left out), an output's or a send's.
+/// Response: `{"known", "active", "reconnecting", "frames", "dropped",
+/// "bytes", "last_error", "encoders"}`, with `{"scene", "follow_program",
+/// "video_encoder", "width", "height"}` for an output and `{"share"}` for a
+/// send; `"encoders"` lists every encoder id this OBS has, comma separated.
+/// Never the key.
 pub extern "C" fn handle_portrait_out_status(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
     ffi_guard(
         "handle_portrait_out_status",
@@ -732,18 +961,33 @@ pub extern "C" fn handle_portrait_out_status(request_data: *mut c_void, response
             let request = obs_data::from_void(request_data);
             let response = obs_data::from_void(response_data);
             let id = obs_data::get_string(request, "id").filter(|s| !s.is_empty()).unwrap_or_else(|| "portrait".into());
-            {
+            // What any connection can say, an output's or a send's.
+            let sending = |o: *mut ObsOutputT| {
+                obs_data::set_bool(response, "active", obs_output_active().is_some_and(|f| f(o)));
+                obs_data::set_bool(response, "reconnecting", obs_output_reconnecting().is_some_and(|f| f(o)));
+                obs_data::set_int(response, "frames", obs_output_get_total_frames().map_or(-1, |f| f(o) as i64));
+                obs_data::set_int(response, "dropped", obs_output_get_frames_dropped().map_or(-1, |f| f(o) as i64));
+                obs_data::set_int(response, "bytes", obs_output_get_total_bytes().map_or(0, |f| f(o) as i64));
+                let err = video_tap::obs_output_get_last_error().map_or(String::new(), |f| cstr(f(o)));
+                obs_data::set_string(response, "last_error", &err);
+            };
+            let send = lock(&SENDS).iter().find(|s| s.id == id).map(|s| (s.output, s.share.clone()));
+            // `"known"`: whether there is such an output or send at all. One
+            // that was stopped (by request, or with the stream it shared) is
+            // not known; one that failed still is, and inactive.
+            obs_data::set_bool(response, "known", true);
+            if let Some((output, share)) = send {
+                sending(output);
+                obs_data::set_string(response, "share", &share);
+            } else {
                 let guard = lock(&OUTS);
                 match guard.iter().find(|o| o.id == id) {
-                    None => obs_data::set_bool(response, "active", false),
+                    None => {
+                        obs_data::set_bool(response, "active", false);
+                        obs_data::set_bool(response, "known", false);
+                    }
                     Some(out) => {
-                        let o = out.output;
-                        obs_data::set_bool(response, "active", obs_output_active().is_some_and(|f| f(o)));
-                        obs_data::set_int(response, "frames", obs_output_get_total_frames().map_or(-1, |f| f(o) as i64));
-                        obs_data::set_int(response, "dropped", obs_output_get_frames_dropped().map_or(-1, |f| f(o) as i64));
-                        obs_data::set_int(response, "bytes", obs_output_get_total_bytes().map_or(0, |f| f(o) as i64));
-                        let err = video_tap::obs_output_get_last_error().map_or(String::new(), |f| cstr(f(o)));
-                        obs_data::set_string(response, "last_error", &err);
+                        sending(out.output);
                         obs_data::set_string(response, "scene", &out.scene);
                         obs_data::set_bool(response, "follow_program", out.follow);
                         obs_data::set_string(response, "video_encoder", &out.video_encoder);
