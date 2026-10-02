@@ -70,7 +70,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::log_line;
 use crate::ndi_ffi::NdiVideoSender;
 use studio_mode_meters_core::metering::{
-    ffi_guard, obs_frontend_get_current_preview_scene, obs_queue_task, obs_source_get_name,
+    ffi_guard, obs_frontend_get_current_preview_scene, obs_get_source_by_name, obs_queue_task, obs_source_get_name,
     obs_source_release, ObsOutputT, ObsSourceT, MAX_AV_PLANES, OBS_OUTPUT_VIDEO, OBS_TASK_UI,
 };
 use studio_mode_meters_core::obs_data::{self, ObsDataT};
@@ -146,6 +146,9 @@ const OBS_SCALE_BICUBIC: c_int = 2;
 
 // enum obs_frontend_event (frontend/api/obs-frontend-api.h), by position.
 const EVENT_SCENE_CHANGED: c_int = 8;
+// A scene made or removed: a portrait feed's scene is found by name, and
+// FrameSW makes and retires those scenes as they are needed.
+const EVENT_SCENE_LIST_CHANGED: c_int = 9;
 const EVENT_TRANSITION_CHANGED: c_int = 10;
 const EVENT_SCENE_COLLECTION_CHANGED: c_int = 13;
 pub(crate) const EVENT_EXIT: c_int = 17;
@@ -196,6 +199,25 @@ const STATS_INTERVAL: Duration = Duration::from_secs(10);
 enum Which {
     Preview,
     Program,
+    /// The portrait twin of FrameSW's scene A, and of B (`portrait_out.rs`,
+    /// `portrait_twin`): the pictures the portrait stream is made from, for
+    /// FrameSW's tall monitors. Which of the two is Preview and which is
+    /// Program changes at each TAKE; FrameSW knows, so the feeds are by
+    /// scene and stay put.
+    PortraitA,
+    PortraitB,
+}
+
+impl Which {
+    /// The scene a portrait feed shows, by name. FrameSW's
+    /// (`ProgramSlot::portrait_scene_name`): the two must stay the same.
+    fn portrait_scene(self) -> Option<&'static CStr> {
+        match self {
+            Which::PortraitA => Some(c"FrameSW A \u{b7} Portrait"),
+            Which::PortraitB => Some(c"FrameSW B \u{b7} Portrait"),
+            Which::Preview | Which::Program => None,
+        }
+    }
 }
 
 /// How frames leave this plugin. NDI stays only until the shared-memory
@@ -280,6 +302,9 @@ struct Shared {
 struct Feed {
     which: Which,
     path: Path,
+    /// The size its scene is laid out in, when that isn't the canvas: a
+    /// portrait scene's items are placed in the portrait frame's pixels.
+    base: Option<(u32, u32)>,
     view: *mut ObsViewT,
     output: *mut ObsOutputT,
     raw_connected: bool,
@@ -294,9 +319,19 @@ unsafe impl Send for Feed {}
 struct Feeds {
     preview: Option<Feed>,
     program: Option<Feed>,
+    portrait_a: Option<Feed>,
+    portrait_b: Option<Feed>,
 }
 
-static FEEDS: Mutex<Feeds> = Mutex::new(Feeds { preview: None, program: None });
+impl Feeds {
+    /// Every feed that is running.
+    fn running(&self) -> impl Iterator<Item = &Feed> {
+        [&self.preview, &self.program, &self.portrait_a, &self.portrait_b].into_iter().flatten()
+    }
+}
+
+static FEEDS: Mutex<Feeds> =
+    Mutex::new(Feeds { preview: None, program: None, portrait_a: None, portrait_b: None });
 static EVENT_CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
 static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static OUTPUT_TYPE_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -596,6 +631,11 @@ struct Request {
     width: u32,
     height: u32,
     program_path: Path,
+    /// The two portrait scenes too, at `portrait_size`, each laid out in
+    /// `portrait_base` pixels.
+    portrait: bool,
+    portrait_size: (u32, u32),
+    portrait_base: (u32, u32),
 }
 
 /// Filename half of a feed's ring (`shm_ring::ring_path`). Short and
@@ -604,6 +644,8 @@ fn feed_key(which: Which) -> &'static str {
     match which {
         Which::Preview => "preview",
         Which::Program => "program",
+        Which::PortraitA => "portrait_a",
+        Which::PortraitB => "portrait_b",
     }
 }
 
@@ -611,6 +653,8 @@ fn ndi_name(which: Which) -> &'static str {
     match which {
         Which::Preview => "FrameSW Preview",
         Which::Program => "FrameSW Program",
+        Which::PortraitA => "FrameSW Portrait A",
+        Which::PortraitB => "FrameSW Portrait B",
     }
 }
 
@@ -656,6 +700,11 @@ fn wanted_source(which: Which) -> *mut ObsSourceT {
         Which::Preview => obs_frontend_get_current_preview_scene().map_or(std::ptr::null_mut(), |f| f()),
         // Channel 0 is the frontend's transition, i.e. what Program shows.
         Which::Program => obs_get_output_source().map_or(std::ptr::null_mut(), |f| f(0)),
+        // Null until FrameSW has made the scene, and again once it is gone.
+        Which::PortraitA | Which::PortraitB => match (obs_get_source_by_name(), which.portrait_scene()) {
+            (Some(get), Some(name)) => get(name.as_ptr()),
+            _ => std::ptr::null_mut(),
+        },
     }
 }
 
@@ -665,6 +714,7 @@ fn start_feed(
     transport: Transport,
     width: u32,
     height: u32,
+    base: Option<(u32, u32)>,
 ) -> Result<Feed, String> {
     let ovi = main_ovi()?;
     let fps_num = ovi.fps_num.max(1);
@@ -706,6 +756,7 @@ fn start_feed(
     let mut feed = Feed {
         which,
         path,
+        base,
         view: std::ptr::null_mut(),
         output: std::ptr::null_mut(),
         raw_connected: false,
@@ -770,6 +821,12 @@ fn attach(feed: &mut Feed) -> Result<(), String> {
                 return Err("obs_output_* unavailable".into());
             };
             let mut ovi = small_ovi(width, height)?;
+            // A portrait scene is laid out in the portrait frame's pixels,
+            // not the canvas's: its mix renders at that size and scales.
+            if let Some((base_w, base_h)) = feed.base {
+                ovi.base_width = base_w;
+                ovi.base_height = base_h;
+            }
             feed.view = create();
             if feed.view.is_null() {
                 return Err("obs_view_create returned null".into());
@@ -859,6 +916,7 @@ fn teardown(mut feed: Feed) {
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile(
     slot: &mut Option<Feed>,
     which: Which,
@@ -867,12 +925,14 @@ fn reconcile(
     transport: Transport,
     width: u32,
     height: u32,
+    base: Option<(u32, u32)>,
 ) -> Result<(), String> {
     let matches = slot.as_ref().is_some_and(|f| {
         f.path == path
             && f.shared.transport == transport
             && f.shared.width == width
             && f.shared.height == height
+            && f.base == base
     });
     if want && matches {
         return Ok(());
@@ -881,7 +941,7 @@ fn reconcile(
         teardown(old);
     }
     if want {
-        *slot = Some(start_feed(which, path, transport, width, height)?);
+        *slot = Some(start_feed(which, path, transport, width, height, base)?);
     }
     Ok(())
 }
@@ -899,6 +959,7 @@ fn apply(req: Request) -> Result<(), String> {
         req.transport,
         req.width,
         req.height,
+        None,
     );
     let program = reconcile(
         &mut feeds.program,
@@ -908,26 +969,61 @@ fn apply(req: Request) -> Result<(), String> {
         req.transport,
         req.width,
         req.height,
+        None,
     );
-    let any = feeds.preview.is_some() || feeds.program.is_some();
+    // The portrait scenes, each in its own small mix. Always the ring:
+    // these exist for FrameSW's tall monitors only.
+    let (pw, ph) = req.portrait_size;
+    let portrait_a = reconcile(
+        &mut feeds.portrait_a,
+        Which::PortraitA,
+        req.portrait,
+        Path::View,
+        Transport::Shm,
+        pw,
+        ph,
+        Some(req.portrait_base),
+    );
+    let portrait_b = reconcile(
+        &mut feeds.portrait_b,
+        Which::PortraitB,
+        req.portrait,
+        Path::View,
+        Transport::Shm,
+        pw,
+        ph,
+        Some(req.portrait_base),
+    );
+    // A feed left running keeps the view it had. Its scene is found by
+    // name, so look again: FrameSW asks once more after making the scenes.
+    for feed in [&feeds.portrait_a, &feeds.portrait_b].into_iter().flatten() {
+        refresh_view(feed, false);
+    }
+    let any = feeds.running().next().is_some();
     drop(feeds);
     if any {
         register_event_callback();
     } else {
         unregister_event_callback();
     }
-    match (preview, program) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(e), Ok(())) => Err(format!("preview: {e}")),
-        (Ok(()), Err(e)) => Err(format!("program: {e}")),
-        (Err(a), Err(b)) => Err(format!("preview: {a}; program: {b}")),
+    let failed: Vec<String> = [("preview", preview), ("program", program), ("portrait A", portrait_a), ("portrait B", portrait_b)]
+        .into_iter()
+        .filter_map(|(name, result)| result.err().map(|e| format!("{name}: {e}")))
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("; "))
     }
 }
 
 /// Stops every feed. Safe from `obs_module_unload` (see module doc).
 pub fn stop_all() {
     let mut feeds = lock(&FEEDS);
-    for feed in [feeds.preview.take(), feeds.program.take()].into_iter().flatten() {
+    for feed in [feeds.preview.take(), feeds.program.take(), feeds.portrait_a.take(), feeds.portrait_b.take()]
+        .into_iter()
+        .flatten()
+    {
         teardown(feed);
     }
 }
@@ -969,18 +1065,19 @@ extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
             }
             EVENT_SCENE_COLLECTION_CLEANUP => {
                 let feeds = lock(&FEEDS);
-                for feed in [&feeds.preview, &feeds.program].into_iter().flatten() {
+                for feed in feeds.running() {
                     refresh_view(feed, true);
                 }
             }
             EVENT_PREVIEW_SCENE_CHANGED
             | EVENT_SCENE_CHANGED
+            | EVENT_SCENE_LIST_CHANGED
             | EVENT_TRANSITION_CHANGED
             | EVENT_STUDIO_MODE_ENABLED
             | EVENT_STUDIO_MODE_DISABLED
             | EVENT_SCENE_COLLECTION_CHANGED => {
                 let feeds = lock(&FEEDS);
-                for feed in [&feeds.preview, &feeds.program].into_iter().flatten() {
+                for feed in feeds.running() {
                     refresh_view(feed, false);
                 }
             }
@@ -1052,7 +1149,12 @@ fn run_on_ui(request: Option<Request>) -> Result<(), String> {
 
 fn write_status(response: *mut ObsDataT) {
     let feeds = lock(&FEEDS);
-    for (key, feed) in [("preview", &feeds.preview), ("program", &feeds.program)] {
+    for (key, feed) in [
+        ("preview", &feeds.preview),
+        ("program", &feeds.program),
+        ("portrait_a", &feeds.portrait_a),
+        ("portrait_b", &feeds.portrait_b),
+    ] {
         let Some(feed) = feed else {
             obs_data::set_bool(response, &format!("{key}_active"), false);
             continue;
@@ -1084,10 +1186,13 @@ fn write_status(response: *mut ObsDataT) {
 }
 
 /// Request: `{"preview": bool, "program": bool, "width": int, "height": int,
-/// "program_path": "raw"|"view"}` — all optional (both feeds, 640x360,
-/// raw). Sets the desired state: a feed not asked for is stopped, a running
-/// feed with the same settings is left alone. Response: `{"ok": bool,
-/// "error"?: string}` plus the `video_feed_status` fields.
+/// "program_path": "raw"|"view", "portrait": bool, "portrait_width": int,
+/// "portrait_height": int, "portrait_base_width": int,
+/// "portrait_base_height": int}` — all optional (Preview and Program,
+/// 640x360, raw; no portrait feeds, which default to 540x960 of a
+/// 1080x1920 scene). Sets the desired state: a feed not asked for is
+/// stopped, a running feed with the same settings is left alone. Response:
+/// `{"ok": bool, "error"?: string}` plus the `video_feed_status` fields.
 pub extern "C" fn handle_start_video_feed(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
     ffi_guard(
         "handle_start_video_feed",
@@ -1112,6 +1217,15 @@ pub extern "C" fn handle_start_video_feed(request_data: *mut c_void, response_da
                     Some("ndi") => Transport::Ndi,
                     _ => Transport::Shm,
                 },
+                portrait: obs_data::get_optional_bool(request, "portrait").unwrap_or(false),
+                portrait_size: (
+                    even(obs_data::get_optional_int(request, "portrait_width").unwrap_or(540)),
+                    even(obs_data::get_optional_int(request, "portrait_height").unwrap_or(960)),
+                ),
+                portrait_base: (
+                    even(obs_data::get_optional_int(request, "portrait_base_width").unwrap_or(1080)),
+                    even(obs_data::get_optional_int(request, "portrait_base_height").unwrap_or(1920)),
+                ),
             };
             match run_on_ui(Some(req)) {
                 Ok(()) => obs_data::set_bool(response, "ok", true),

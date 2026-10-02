@@ -82,6 +82,19 @@ nowhere else: never logged, never returned.
 | `stop_portrait_out` | Stops the stream or the site with that `id`. |
 | `portrait_out_status` | Whether it is live or reconnecting, frames sent and dropped, bytes sent, and its last error. Read-only. |
 
+### Requests that send monitor pictures
+
+These copy small pictures of what OBS is showing into shared memory on the
+same computer, for FrameSW's own Preview and Program monitors. Nothing
+leaves the machine, and nothing in OBS's scenes, settings or outputs is
+changed: each picture is rendered in a small mix of its own.
+
+| Request | What it does |
+|---|---|
+| `start_video_feed` | Sets which pictures are sent: OBS's `preview` and `program` at `width`×`height` (640×360 unless asked otherwise) and, with `portrait`, the two scenes `FrameSW A · Portrait` and `FrameSW B · Portrait` at `portrait_width`×`portrait_height` (540×960), each laid out in `portrait_base_width`×`portrait_base_height` pixels (1080×1920). A picture not asked for is stopped; one already running with the same settings is left alone. A portrait scene is found by name and followed as FrameSW makes and removes it. |
+| `stop_video_feed` | Stops them all. |
+| `video_feed_status` | Which are running, their sizes and frame counters. Read-only. |
+
 ### Read-only requests
 
 | Request | What it does |
