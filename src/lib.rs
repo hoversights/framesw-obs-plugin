@@ -54,6 +54,7 @@ mod audio_tap;
 mod input_probe;
 mod ndi_ffi;
 mod portrait_out;
+mod scale_filter;
 mod shm_ring;
 mod video_tap;
 
@@ -2293,6 +2294,7 @@ pub extern "C" fn obs_module_post_load() {
         ]
         .into_iter()
         .chain(input_probe::requests())
+        .chain(scale_filter::requests())
         {
             if calldata::register_request(vendor, request_type, callback) {
                 log_line(&format!("registered vendor request \"{request_type}\""));

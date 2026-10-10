@@ -54,7 +54,7 @@ The plugin registers as obs-websocket vendor `framesw` and exposes 15
 requests. Any obs-websocket client can call them; they are not private to
 FrameSW.
 
-**Four of them change your OBS, and three more stream from it.** They are
+**Five of them change your OBS, and three more stream from it.** They are
 listed first and marked, because if you install this from a plugin directory
 you should know that before you do, not after.
 
@@ -66,6 +66,7 @@ you should know that before you do, not after.
 | `ensure_profile` | Creates an OBS **Profile** if missing and switches to it. Runs on OBS's UI thread deliberately: doing this over obs-websocket's pooled thread raced `config_save_safe` and left a half-written `basic.ini`. |
 | `projector_on_top` | Toggles OBS's "projectors always on top" setting, which lives in `user.ini`. Exposed here because obs-websocket has no request for it and the file cannot be safely edited on disk while OBS is running. |
 | `ndi_outputs` | Reads and sets DistroAV's Main/Preview NDI output switches, also in `user.ini`, for the same reason. No effect if DistroAV is not installed. |
+| `set_scale_filters` | Sets OBS's own **Scale Filtering** on the items of one named `scene`: the items whose ids are listed in `lanczos` (comma-separated) get Lanczos, every other item of that scene goes back to OBS's default. FrameSW sends it for its 9:16 scenes, for a picture drawn larger than its own pixels. Runs on OBS's UI thread. Exposed here because obs-websocket has no request for an item's scale filter. |
 
 ### Requests that stream
 
