@@ -57,6 +57,7 @@ mod portrait_out;
 mod scale_filter;
 mod shm_ring;
 mod video_tap;
+mod view_source;
 
 // `calldata`, `obs_data` and `platform` now live in the shared core crate
 // so the community metering plugin builds on the same copy of this
@@ -2004,6 +2005,9 @@ pub extern "C" fn obs_module_load() -> bool {
         studio_mode_meters_core::metering::set_audio_sink(audio_tap::forward_if_tapped);
         // Output types can only be registered during obs_module_load.
         video_tap::register_output_type();
+        // Source types too: a view of a shared guest page or camera, so
+        // each of its boxes can carry its own mask (`view_source`).
+        view_source::register_view_source();
         log_line("loaded — watching for audio on Preview-only sources");
         spawn_periodic_rescan();
         true
