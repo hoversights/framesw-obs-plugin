@@ -19,13 +19,29 @@ Write-Host "Building..."
 # Release, plain host triple (this only ever builds on the Windows machine
 # itself, whose host IS x86_64-pc-windows-msvc - an explicit --target just
 # moves the artifact into a different target subdirectory for no benefit).
+# Relaxed for cargo as for git below: cargo writes its progress
+# ("Compiling ...") to stderr, and with "Stop" PowerShell 5.1 wraps the
+# first such line in a NativeCommandError and ends the script there
+# (Windows, 2026-10-23: packaging stopped before any file was made).
+# Success is read from the exit code instead.
+$PrevEap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 cargo build --release
-if ($LASTEXITCODE -ne 0) { exit 1 }
+$CargoExit = $LASTEXITCODE
+$ErrorActionPreference = $PrevEap
+if ($CargoExit -ne 0) { exit 1 }
 
 $PluginDir = "target\framesw-companion"
 if (Test-Path $PluginDir) { Remove-Item -Recurse -Force $PluginDir }
 New-Item -ItemType Directory -Path "$PluginDir\bin\64bit" -Force | Out-Null
 
+# Two layouts, one folder (OBS 33.0, 2026-10: "Legacy Plugin Locations").
+# OBS 33 and later load <name>\<name>.dll first and then skip the same
+# plugin in a legacy layout; OBS 32 and earlier only know
+# <name>\bin\64bit\<name>.dll. OBS 34 will not load the legacy one at all.
+# The old copy goes once FrameSW asks for OBS 33 or later.
+Copy-Item "target\release\framesw_obs_plugin.dll" `
+    "$PluginDir\framesw-companion.dll"
 Copy-Item "target\release\framesw_obs_plugin.dll" `
     "$PluginDir\bin\64bit\framesw-companion.dll"
 
@@ -68,11 +84,9 @@ Write-Host ""
 Write-Host "Built: $PluginDir"
 Write-Host ""
 Write-Host "To install for testing, copy the 'framesw-companion' folder into"
-Write-Host "OBS's plugins directory. Two conventions exist depending on OBS"
-Write-Host "version/install method - WINDOWS_HANDOFF.md has the details on"
-Write-Host "which one this actual install uses:"
-Write-Host "  %ProgramData%\obs-studio\plugins\framesw-companion\bin\64bit\"
-Write-Host "  <OBS install dir>\obs-plugins\64bit\framesw-companion.dll  (flat, no per-plugin folder)"
+Write-Host "%ProgramData%\obs-studio\plugins\ (FrameSW does this itself on launch)."
+Write-Host "It holds the DLL in both layouts: framesw-companion.dll for OBS 33+,"
+Write-Host "bin\64bit\framesw-companion.dll for OBS 32."
 Write-Host ""
 Write-Host "Then fully quit and relaunch OBS Studio, and check its log"
 Write-Host "(Help > Log Files > View Current Log, or"
