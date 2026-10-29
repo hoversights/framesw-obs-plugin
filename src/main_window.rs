@@ -105,6 +105,12 @@ extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
                 }
             }
             EVENT_EXIT => {
+                // Not about the window: this is the plugin's one frontend
+                // callback registered from the start, so the device-list
+                // probes it keeps and any Mic check still listening are let
+                // go here, before obs_shutdown.
+                studio_mode_meters_core::metering::release_kept_probes();
+                crate::input_probe::end_all_at_exit();
                 if CALLBACK_REGISTERED.swap(false, Ordering::AcqRel) {
                     if let Some(remove) = obs_frontend_remove_event_callback() {
                         remove(on_frontend_event, std::ptr::null_mut());

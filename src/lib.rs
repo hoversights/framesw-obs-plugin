@@ -52,6 +52,7 @@ use std::sync::atomic::Ordering;
 
 mod audio_tap;
 mod input_probe;
+mod loudness;
 mod main_window;
 mod ndi_ffi;
 mod portrait_out;
@@ -862,7 +863,10 @@ fn handle_list_devices_impl(
         ran: false,
         kind,
         property,
-        settings_json: obs_data::get_string(request_data, "settings"),
+        // A missing key reads as "", and "" handed to
+        // obs_data_create_from_json logged "Failed reading json string" on
+        // every device poll (2026-10-29: ~80,000 lines in two days).
+        settings_json: obs_data::get_string(request_data, "settings").filter(|s| !s.is_empty()),
         devices: None,
         found_property: false,
         raw_count: 0,

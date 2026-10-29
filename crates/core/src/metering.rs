@@ -117,6 +117,17 @@ crate::resolved_fn!(obs_get_audio_info: extern "C" fn(*mut ObsAudioInfo) -> bool
 /// How many channels OBS is mixing (its speaker layout), or 0 if unknown.
 /// Every source is converted to this layout before its capture callbacks
 /// fire, so it is how many planes of `audio_data` carry samples.
+/// OBS's audio sample rate (48000 unless set otherwise), or 0 when it
+/// can't be read.
+pub fn output_sample_rate() -> u32 {
+    obs_get_audio_info()
+        .and_then(|get_info| {
+            let mut info = ObsAudioInfo { samples_per_sec: 0, speakers: 0 };
+            get_info(&mut info).then_some(info)
+        })
+        .map_or(0, |info| info.samples_per_sec)
+}
+
 pub fn output_channels() -> usize {
     obs_get_audio_info()
         .and_then(|get_info| {
@@ -252,10 +263,33 @@ pub fn enumerate_list_property_diag(
     .ok()?;
     let prop_key = std::ffi::CString::new(property).ok()?;
 
-    let source = obs_source_create_private(id.as_ptr(), name.as_ptr(), settings);
-    if source.is_null() {
-        return None;
-    }
+    // A camera probe with no settings is made once and asked again: its
+    // properties list the devices afresh each time, and creating one every
+    // poll made OBS's camera plugin log "No device selected" every 4 s
+    // (2026-10-29: ~80,000 lines in two days). Camera kinds only, which open
+    // nothing without a device: a microphone probe captures the default
+    // input, and a live Core Audio source left to OBS's shutdown crashes it.
+    let kept = settings.is_null() && KEPT_PROBE_KINDS.contains(&kind);
+    let held = if kept {
+        KEPT_PROBES.lock().ok().and_then(|probes| probes.iter().find(|(k, _)| k == kind).map(|(_, p)| *p as *mut ObsSourceT))
+    } else {
+        None
+    };
+    let source = match held {
+        Some(source) => source,
+        None => {
+            let source = obs_source_create_private(id.as_ptr(), name.as_ptr(), settings);
+            if source.is_null() {
+                return None;
+            }
+            if kept {
+                if let Ok(mut probes) = KEPT_PROBES.lock() {
+                    probes.push((kind.to_string(), source as usize));
+                }
+            }
+            source
+        }
+    };
 
     let mut out = Vec::new();
     let mut found = false;
@@ -306,11 +340,36 @@ pub fn enumerate_list_property_diag(
         }
         obs_properties_destroy(props);
     }
-    // Released unconditionally, including on every early return above this
+    // Released unless kept, including on every early return above this
     // point being impossible by construction: nothing between the create
-    // and here can return early.
-    obs_source_release(source);
+    // and here can return early. A kept probe goes at OBS's exit
+    // (`release_kept_probes`).
+    if !kept {
+        obs_source_release(source);
+    }
     Some((out, found, raw, fmt, used_int))
+}
+
+/// The kinds whose probe is kept (`enumerate_list_property_diag`): macOS's
+/// camera kinds, which select no device and open nothing when made without
+/// settings ("No device selected"). Windows' `dshow_input` is not measured.
+const KEPT_PROBE_KINDS: [&str; 2] = ["av_capture_input_v2", "av_capture_input"];
+
+/// The kept probes, by kind, as addresses. Made and used on the UI thread
+/// only (device lists are read there).
+static KEPT_PROBES: Mutex<Vec<(String, usize)>> = Mutex::new(Vec::new());
+
+/// Releases the kept probes. At OBS_FRONTEND_EVENT_EXIT, on the UI thread,
+/// before `obs_shutdown`, while OBS still destroys sources the usual way.
+pub fn release_kept_probes() {
+    let Some(release) = obs_source_release() else { return };
+    let probes = match KEPT_PROBES.lock() {
+        Ok(mut probes) => std::mem::take(&mut *probes),
+        Err(_) => return,
+    };
+    for (_, source) in probes {
+        release(source as *mut ObsSourceT);
+    }
 }
 
 // `libobs/obs.h`: the pair a projector window uses to say "render this

@@ -36,10 +36,12 @@ use std::time::{Duration, Instant};
 use studio_mode_meters_core::metering::{
     ffi_guard, obs_get_source_by_name, obs_queue_task, obs_source_add_audio_capture_callback,
     obs_source_create_private, obs_source_release, obs_source_remove_audio_capture_callback,
-    output_channels, AudioData, ObsSourceT, MAX_AV_PLANES, OBS_TASK_UI, SHUTTING_DOWN, THREADS, VENDOR,
+    output_channels, output_sample_rate, AudioData, ObsSourceT, MAX_AV_PLANES, OBS_TASK_UI, SHUTTING_DOWN, THREADS, VENDOR,
 };
 use studio_mode_meters_core::obs_data::{self, ObsDataT};
 use studio_mode_meters_core::{calldata, log_line};
+
+use crate::loudness::Loudness;
 
 // Signatures verified against obsproject/obs-studio@master, 2026-09-25:
 // libobs/obs.h
@@ -86,6 +88,9 @@ struct Stats {
     /// Frames counted after the warm-up, per channel.
     frames: u64,
     channels: Vec<ChannelStats>,
+    /// How loud it is while it makes sound (`loudness.rs`), for the input
+    /// stage's trim.
+    loudness: Loudness,
 }
 
 /// One probe in flight. The source pointer is only ever touched to remove
@@ -129,6 +134,14 @@ extern "C" fn probe_callback(param: *mut c_void, _source: *mut ObsSourceT, audio
             if frames == 0 {
                 return;
             }
+            let planes: Vec<Option<&[f32]>> = (0..s.channels.len())
+                .map(|c| {
+                    let plane = audio_data.data[c];
+                    // Safety: as below, valid for this callback.
+                    (!plane.is_null()).then(|| unsafe { std::slice::from_raw_parts(plane.cast::<f32>(), frames) })
+                })
+                .collect();
+            s.loudness.push(&planes);
             for (c, channel) in s.channels.iter_mut().enumerate() {
                 let plane = audio_data.data[c];
                 if plane.is_null() {
@@ -245,6 +258,7 @@ fn create_probe(input_name: &str) -> Result<(u64, String), String> {
         warmup_packets: 0,
         frames: 0,
         channels: vec![ChannelStats::default(); channels],
+        loudness: Loudness::new(output_sample_rate(), channels),
     }));
     let param = (&*stats as *const Mutex<Stats>).cast_mut().cast::<c_void>();
     add_cb(source, probe_callback, param);
@@ -300,16 +314,30 @@ fn finish(id: u64) {
         queue(OBS_TASK_UI, release_on_ui_thread, probe.source.cast(), false);
     }
 
-    let stats = probe.stats.lock().map(|s| Stats {
-        created: s.created,
-        first_packet: s.first_packet,
-        packets: s.packets,
-        warmup_packets: s.warmup_packets,
-        frames: s.frames,
-        channels: s.channels.clone(),
-    });
-    let Ok(stats) = stats else { return };
+    let Ok(stats) = probe.stats.lock() else { return };
     emit_result(id, &probe.input_name, &probe.kind, &stats);
+}
+
+/// OBS is exiting (OBS_FRONTEND_EVENT_EXIT, on the UI thread, before
+/// `obs_shutdown`): every probe still listening is ended here, its copy
+/// released while OBS still destroys sources the usual way. Left to OBS's
+/// teardown, a live Core Audio copy outlives `stop_audio()` and its next
+/// buffer crashes OBS (`copy_audio_data`, 2026-10-29). No result is sent.
+pub fn end_all_at_exit() {
+    let probes: Vec<Probe> = match PROBES.lock() {
+        Ok(mut probes) => probes.as_mut().map(|p| p.drain().map(|(_, probe)| probe).collect()).unwrap_or_default(),
+        Err(_) => return,
+    };
+    for probe in probes {
+        if let Some(remove_cb) = obs_source_remove_audio_capture_callback() {
+            let param = (&*probe.stats as *const Mutex<Stats>).cast_mut().cast::<c_void>();
+            remove_cb(probe.source, probe_callback, param);
+        }
+        if let Some(release) = obs_source_release() {
+            release(probe.source);
+        }
+        log_line(&format!("mic check on \"{}\" ended: OBS is exiting", probe.input_name));
+    }
 }
 
 fn emit_result(id: u64, input_name: &str, kind: &str, s: &Stats) {
@@ -347,6 +375,13 @@ fn emit_result(id: u64, input_name: &str, kind: &str, s: &Stats) {
     let channels_k = key("channels");
     set_array(root, channels_k.as_ptr(), channels);
     array_release(channels);
+    // How loud while it made sound, and for how long; absent when nothing
+    // rose above the standard's −70 LUFS gate.
+    if let Some((lufs, seconds)) = s.loudness.result() {
+        let lufs_k = key("loudness_lufs");
+        set_double(root, lufs_k.as_ptr(), lufs);
+        obs_data::set_int(root, "loud_ms", (seconds * 1000.0).round() as i64);
+    }
     obs_data::set_bool(root, "ok", true);
     if !vendor.is_null() {
         calldata::vendor_emit_event(vendor, "input_probe_result", obs_data::as_void(root));
@@ -369,13 +404,14 @@ extern "C" fn handle_probe_input(request_data: *mut c_void, response_data: *mut 
 }
 
 /// Request: `{"input_name": "...", "window_ms": 1000}` (`window_ms`
-/// optional, 300–5000). Response at once: `{"ok": true, "probe_id": n,
+/// optional, 300–15000; the input stage listens for several seconds). Response at once: `{"ok": true, "probe_id": n,
 /// "kind": "..."}`, or `{"ok": false, "error": "..."}` — including "not a
 /// device input" for a guest link, NDI or media, which FrameSW checks
 /// another way. The measurement follows as the `input_probe_result` event:
 /// `{"probe_id", "input_name", "kind", "packets", "warmup_packets",
 /// "frames", "first_packet_ms", "channels": [{"peak_db", "rms_db",
-/// "zero_fraction"}]}`. `frames == 0` means nothing arrived at all.
+/// "zero_fraction"}], "loudness_lufs", "loud_ms"}` (the last two when it
+/// heard sound, `loudness.rs`). `frames == 0` means nothing arrived at all.
 fn handle_probe_input_impl(request_data: *mut c_void, response_data: *mut c_void) {
     let request_data = obs_data::from_void(request_data);
     let response_data = obs_data::from_void(response_data);
@@ -385,7 +421,7 @@ fn handle_probe_input_impl(request_data: *mut c_void, response_data: *mut c_void
         return;
     };
     let window_ms = obs_data::get_optional_int(request_data, "window_ms")
-        .map_or(DEFAULT_WINDOW_MS, |ms| ms.clamp(300, 5000) as u64);
+        .map_or(DEFAULT_WINDOW_MS, |ms| ms.clamp(300, 15000) as u64);
     let Some(queue) = obs_queue_task() else {
         obs_data::set_bool(response_data, "ok", false);
         obs_data::set_string(response_data, "error", "obs_queue_task unavailable");
