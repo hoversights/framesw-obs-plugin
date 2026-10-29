@@ -382,6 +382,12 @@ fn emit_result(id: u64, input_name: &str, kind: &str, s: &Stats) {
         set_double(root, lufs_k.as_ptr(), lufs);
         obs_data::set_int(root, "loud_ms", (seconds * 1000.0).round() as i64);
     }
+    // The floor and the loud part, ungated, to tell a room from sound.
+    if let Some((floor, top)) = s.loudness.spread() {
+        let (floor_k, top_k) = (key("floor_lufs"), key("top_lufs"));
+        set_double(root, floor_k.as_ptr(), floor);
+        set_double(root, top_k.as_ptr(), top);
+    }
     obs_data::set_bool(root, "ok", true);
     if !vendor.is_null() {
         calldata::vendor_emit_event(vendor, "input_probe_result", obs_data::as_void(root));
@@ -410,8 +416,9 @@ extern "C" fn handle_probe_input(request_data: *mut c_void, response_data: *mut 
 /// another way. The measurement follows as the `input_probe_result` event:
 /// `{"probe_id", "input_name", "kind", "packets", "warmup_packets",
 /// "frames", "first_packet_ms", "channels": [{"peak_db", "rms_db",
-/// "zero_fraction"}], "loudness_lufs", "loud_ms"}` (the last two when it
-/// heard sound, `loudness.rs`). `frames == 0` means nothing arrived at all.
+/// "zero_fraction"}], "loudness_lufs", "loud_ms", "floor_lufs",
+/// "top_lufs"}` (loudness when it heard sound, the floor and top once it
+/// had 400 ms, `loudness.rs`). `frames == 0` means nothing arrived at all.
 fn handle_probe_input_impl(request_data: *mut c_void, response_data: *mut c_void) {
     let request_data = obs_data::from_void(request_data);
     let response_data = obs_data::from_void(response_data);

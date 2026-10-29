@@ -112,7 +112,7 @@ impl Loudness {
     /// (the blocks past both gates, at 100 ms each). `None` before a full
     /// 400 ms block, or when nothing rose above −70 LUFS.
     pub fn result(&self) -> Option<(f64, f64)> {
-        let blocks: Vec<f64> = self.steps.windows(4).map(|w| w.iter().sum::<f64>() / 4.0).collect();
+        let blocks = self.blocks();
         let loud: Vec<f64> = blocks.iter().copied().filter(|&z| z > 0.0 && lufs(z) > ABSOLUTE_GATE_LUFS).collect();
         if loud.is_empty() {
             return None;
@@ -123,6 +123,27 @@ impl Loudness {
             return None;
         }
         Some((lufs(kept.iter().sum::<f64>() / kept.len() as f64), kept.len() as f64 * 0.1))
+    }
+
+    /// The spread, ungated: the loudness of the quietest blocks (the 10th
+    /// percentile, the floor) and of the loud part (the 95th). A room is
+    /// steady, so the two sit close; speech and most programme rise and
+    /// fall. The gates alone can't tell a room from sound: a room at −47
+    /// LUFS passes the −70 gate (measured 2026-10-29). Silence reads −100.
+    /// `None` before a full 400 ms block.
+    pub fn spread(&self) -> Option<(f64, f64)> {
+        let mut levels: Vec<f64> = self.blocks().into_iter().map(|z| if z > 0.0 { lufs(z).max(-100.0) } else { -100.0 }).collect();
+        if levels.is_empty() {
+            return None;
+        }
+        levels.sort_by(f64::total_cmp);
+        let at = |p: f64| levels[((levels.len() - 1) as f64 * p).round() as usize];
+        Some((at(0.10), at(0.95)))
+    }
+
+    /// Each 400 ms block's mean square, overlapping by 75 %.
+    fn blocks(&self) -> Vec<f64> {
+        self.steps.windows(4).map(|w| w.iter().sum::<f64>() / 4.0).collect()
     }
 }
 
@@ -197,6 +218,37 @@ mod tests {
         let (l, secs) = measure(48000, &[Some(&gappy), Some(&gappy)]).unwrap();
         assert!((l - -20.0).abs() < 0.3, "{l}");
         assert!(secs < 16.5, "{secs}");
+    }
+
+    /// A steady sound has no spread; sound with silences between has the
+    /// silence as its floor and the sound as its top.
+    #[test]
+    fn the_spread_tells_steady_from_rising_and_falling() {
+        let steady = sine(48000, 997.0, 0.01, 4.0);
+        let (floor, top) = measure_spread(48000, &[Some(&steady), Some(&steady)]).unwrap();
+        assert!((top - floor).abs() < 0.5, "{floor} {top}");
+        assert!((top - -40.0).abs() < 0.5, "{top}");
+
+        let tone = sine(48000, 997.0, 0.1, 2.0);
+        let mut gappy = Vec::new();
+        for _ in 0..3 {
+            gappy.extend_from_slice(&tone);
+            gappy.extend(std::iter::repeat_n(0.0f32, 48000 * 2));
+        }
+        let (floor, top) = measure_spread(48000, &[Some(&gappy), Some(&gappy)]).unwrap();
+        assert_eq!(floor, -100.0);
+        assert!((top - -20.0).abs() < 0.5, "{top}");
+    }
+
+    fn measure_spread(fs: u32, planes: &[Option<&[f32]>]) -> Option<(f64, f64)> {
+        let mut m = Loudness::new(fs, planes.len());
+        let len = planes.iter().flatten().map(|p| p.len()).max().unwrap_or(0);
+        for start in (0..len).step_by(1024) {
+            let end = (start + 1024).min(len);
+            let chunk: Vec<Option<&[f32]>> = planes.iter().map(|p| p.map(|p| &p[start..end])).collect();
+            m.push(&chunk);
+        }
+        m.spread()
     }
 
     #[test]
