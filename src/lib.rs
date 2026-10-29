@@ -52,6 +52,7 @@ use std::sync::atomic::Ordering;
 
 mod audio_tap;
 mod input_probe;
+mod main_window;
 mod ndi_ffi;
 mod portrait_out;
 mod scale_filter;
@@ -2264,6 +2265,7 @@ pub extern "C" fn obs_module_post_load() {
             return;
         }
         VENDOR.store(vendor, Ordering::Release);
+        main_window::init();
         log_line("registered as obs-websocket vendor \"framesw\" — forwarding audio levels");
         spawn_emit_loop();
         for (request_type, callback) in [
@@ -2298,6 +2300,7 @@ pub extern "C" fn obs_module_post_load() {
         ]
         .into_iter()
         .chain(input_probe::requests())
+        .chain(main_window::requests())
         .chain(scale_filter::requests())
         {
             if calldata::register_request(vendor, request_type, callback) {
