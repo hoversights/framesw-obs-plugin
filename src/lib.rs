@@ -52,6 +52,7 @@ use std::sync::atomic::Ordering;
 
 mod audio_tap;
 mod input_probe;
+mod iso_out;
 mod loudness;
 mod main_window;
 mod ndi_ffi;
@@ -2301,6 +2302,8 @@ pub extern "C" fn obs_module_post_load() {
             ("start_site_out", portrait_out::handle_start_site_out as calldata::RequestCallbackFn),
             ("stop_portrait_out", portrait_out::handle_stop_portrait_out as calldata::RequestCallbackFn),
             ("portrait_out_status", portrait_out::handle_portrait_out_status as calldata::RequestCallbackFn),
+            ("start_iso", iso_out::handle_start_iso as calldata::RequestCallbackFn),
+            ("stop_iso", iso_out::handle_stop_iso as calldata::RequestCallbackFn),
         ]
         .into_iter()
         .chain(input_probe::requests())
@@ -2349,6 +2352,8 @@ pub extern "C" fn obs_module_unload() {
         // Likewise the portrait output (portrait_out.rs), without touching
         // the frontend's callbacks.
         portrait_out::stop_output();
+        // And any separate recording (iso_out.rs).
+        iso_out::stop_all();
         log_line("unloaded — background threads stopped cleanly");
     })
 }
