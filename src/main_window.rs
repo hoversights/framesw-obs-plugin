@@ -33,6 +33,17 @@
 //! loading has finished, queued behind the rest of OBSInit (which calls
 //! `activateWindow()` after FINISHED_LOADING), so it never depends on
 //! when FrameSW asks.
+//!
+//! That hide comes after OBS has shown the window, and FrameSW hiding the
+//! app from outside takes it down a look later: 30 ms on screen, 0.85 s
+//! into the start, seen by the operator as a flash on every connect
+//! (measured 2026-10-30, `CGWindowListCopyWindowInfo` every 5 ms). So an
+//! OBS that FrameSW starts out of sight (`FRAMESW_HIDE_MAIN_WINDOW=1` in
+//! its environment) has its main window made see-through here, at
+//! post-load, which OBS runs inside `OBSBasic::OBSInit` before its
+//! `show()`. Once loading has finished it is taken off screen and made
+//! opaque again, in that order. Only the main window: dialogs and
+//! projectors are windows of their own.
 
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -64,8 +75,15 @@ static WANT_HIDDEN: AtomicBool = AtomicBool::new(false);
 /// already shown it.
 static LOADED: AtomicBool = AtomicBool::new(false);
 static CALLBACK_REGISTERED: AtomicBool = AtomicBool::new(false);
+/// The main window is see-through, from post-load until it has been taken
+/// off screen once loading finished (or until it is shown).
+static SEE_THROUGH: AtomicBool = AtomicBool::new(false);
 
-/// Called from `obs_module_post_load`.
+/// Set to `1` by FrameSW in the environment of an OBS it starts out of
+/// sight.
+const START_HIDDEN_ENV: &str = "FRAMESW_HIDE_MAIN_WINDOW";
+
+/// Called from `obs_module_post_load`, on the UI thread.
 pub fn init() {
     if CALLBACK_REGISTERED.swap(true, Ordering::AcqRel) {
         return;
@@ -75,6 +93,18 @@ pub fn init() {
         None => {
             CALLBACK_REGISTERED.store(false, Ordering::Release);
             log_line("obs_frontend_add_event_callback unavailable: main_window can't hide OBS before it finishes loading");
+            // Nothing would make it opaque again: left as OBS shows it.
+            return;
+        }
+    }
+    if cfg!(target_os = "macos") && std::env::var_os(START_HIDDEN_ENV).is_some_and(|v| v == "1") {
+        WANT_HIDDEN.store(true, Ordering::Release);
+        match set_alpha(0.0) {
+            Ok(()) => {
+                SEE_THROUGH.store(true, Ordering::Release);
+                log_line("main window see-through until OBS finishes loading (started out of sight)");
+            }
+            Err(e) => log_line(&format!("main window not made see-through: {e}")),
         }
     }
 }
@@ -86,7 +116,7 @@ extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
         std::panic::AssertUnwindSafe(|| match event {
             EVENT_FINISHED_LOADING => {
                 LOADED.store(true, Ordering::Release);
-                if WANT_HIDDEN.load(Ordering::Acquire) {
+                if WANT_HIDDEN.load(Ordering::Acquire) || SEE_THROUGH.load(Ordering::Acquire) {
                     // From another thread, so OBS's AutoConnection queues it
                     // behind the rest of OBSInit rather than running it here
                     // (OBSApp.cpp `ui_task_handler`: wait=false is
@@ -122,10 +152,10 @@ extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
     );
 }
 
-/// Puts the main window on screen and in front, or takes it off screen.
+/// The main window's NSWindow, with `sel_registerName` and `objc_msgSend`.
 /// UI thread only (AppKit's main thread).
 #[cfg(target_os = "macos")]
-fn apply(show: bool) -> Result<(), String> {
+fn ns_window() -> Result<(*mut c_void, extern "C" fn(*const c_char) -> *mut c_void, extern "C" fn()), String> {
     let handle = obs_frontend_get_main_window_handle().ok_or("obs_frontend_get_main_window_handle unavailable")?;
     let (Some(sel), Some(send)) = (sel_registerName(), objc_msgSend()) else {
         return Err("the Objective-C runtime isn't reachable".into());
@@ -134,18 +164,47 @@ fn apply(show: bool) -> Result<(), String> {
     if view.is_null() {
         return Err("OBS has no main window".into());
     }
-    // SAFETY: objc_msgSend called through the exact prototypes of
-    // `-[NSView window]` (id (id, SEL)) and `-[NSWindow orderOut:]` /
-    // `-[NSWindow makeKeyAndOrderFront:]` (void (id, SEL, id)).
-    unsafe {
+    // SAFETY: objc_msgSend called through the exact prototype of
+    // `-[NSView window]`: id (id, SEL).
+    let window = unsafe {
         let get: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(send);
+        get(view, sel(c"window".as_ptr()))
+    };
+    if window.is_null() {
+        return Err("the main window's NSWindow isn't there".into());
+    }
+    Ok((window, sel, send))
+}
+
+/// Puts the main window on screen and in front, or takes it off screen.
+/// Shown, it is opaque. UI thread only (AppKit's main thread).
+#[cfg(target_os = "macos")]
+fn apply(show: bool) -> Result<(), String> {
+    if show && SEE_THROUGH.swap(false, Ordering::AcqRel) {
+        set_alpha(1.0)?;
+    }
+    let (window, sel, send) = ns_window()?;
+    // SAFETY: objc_msgSend called through the exact prototype of
+    // `-[NSWindow orderOut:]` / `-[NSWindow makeKeyAndOrderFront:]`:
+    // void (id, SEL, id).
+    unsafe {
         let order: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(send);
-        let window = get(view, sel(c"window".as_ptr()));
-        if window.is_null() {
-            return Err("the main window's NSWindow isn't there".into());
-        }
         let message = if show { c"makeKeyAndOrderFront:" } else { c"orderOut:" };
         order(window, sel(message.as_ptr()), std::ptr::null_mut());
+    }
+    Ok(())
+}
+
+/// The main window's opacity, 0.0 (see-through) to 1.0. UI thread only.
+#[cfg(target_os = "macos")]
+fn set_alpha(alpha: f64) -> Result<(), String> {
+    let (window, sel, send) = ns_window()?;
+    // SAFETY: objc_msgSend called through the exact prototype of
+    // `-[NSWindow setAlphaValue:]` (NSWindow.h: `@property CGFloat
+    // alphaValue`; CGFloat is double on 64-bit): void (id, SEL, CGFloat).
+    unsafe {
+        let set: extern "C" fn(*mut c_void, *mut c_void, f64) = std::mem::transmute(send);
+        set(window, sel(c"setAlphaValue:".as_ptr()), alpha);
     }
     Ok(())
 }
@@ -155,18 +214,29 @@ fn apply(_show: bool) -> Result<(), String> {
     Err("main_window is macOS only; FrameSW hides OBS's window itself elsewhere".into())
 }
 
+#[cfg(not(target_os = "macos"))]
+fn set_alpha(_alpha: f64) -> Result<(), String> {
+    Err("main_window is macOS only".into())
+}
+
 extern "C" fn deferred_hide_on_ui_thread(_param: *mut c_void) {
     ffi_guard(
         "main_window::deferred_hide_on_ui_thread",
         (),
         std::panic::AssertUnwindSafe(|| {
             // Asked again since: whatever is wanted now.
-            if !WANT_HIDDEN.load(Ordering::Acquire) {
-                return;
+            if WANT_HIDDEN.load(Ordering::Acquire) {
+                match apply(false) {
+                    Ok(()) => log_line("main window hidden once OBS finished loading"),
+                    Err(e) => log_line(&format!("main window not hidden after loading: {e}")),
+                }
             }
-            match apply(false) {
-                Ok(()) => log_line("main window hidden once OBS finished loading"),
-                Err(e) => log_line(&format!("main window not hidden after loading: {e}")),
+            // Off screen first, then opaque: never on screen in between.
+            if SEE_THROUGH.swap(false, Ordering::AcqRel) {
+                match set_alpha(1.0) {
+                    Ok(()) => log_line("main window opaque again"),
+                    Err(e) => log_line(&format!("main window not made opaque again: {e}")),
+                }
             }
         }),
     );
