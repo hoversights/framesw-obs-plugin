@@ -30,6 +30,11 @@
 //! Program, so a source off air gives its file no sound, while its picture
 //! is recorded all the time.
 //!
+//! FrameSW arms them (`arm_iso`) and the plugin starts them the moment OBS's
+//! own recording starts, whoever started it, each named after OBS's file
+//! (`2026-10-31 17-30-00 PiP 1.mov` beside `2026-10-31 17-30-00.mov`), and
+//! stops them as it stops. `start_iso` starts one now, for tests.
+//!
 //! Facts from libobs (checked for `portrait_out.rs` against 32.2.2) this
 //! depends on: an encoder may take a view's `video_t`;
 //! `obs_encoder_set_video` refuses once the encoder is active, so it is set
@@ -56,6 +61,11 @@ use studio_mode_meters_core::obs_data::{self, ObsDataT};
 // A source's own size. libobs/obs.h: `uint32_t obs_source_get_width(obs_source_t *source)`.
 studio_mode_meters_core::resolved_fn!(obs_source_get_width: extern "C" fn(*mut ObsSourceT) -> u32);
 studio_mode_meters_core::resolved_fn!(obs_source_get_height: extern "C" fn(*mut ObsSourceT) -> u32);
+// OBS's recording and the file it writes (obs-frontend-api.h, obs.h; both
+// new references).
+studio_mode_meters_core::resolved_fn!(obs_frontend_get_recording_output: extern "C" fn() -> *mut ObsOutputT);
+studio_mode_meters_core::resolved_fn!(obs_frontend_recording_active: extern "C" fn() -> bool);
+studio_mode_meters_core::resolved_fn!(obs_output_get_settings: extern "C" fn(*mut ObsOutputT) -> *mut ObsDataT);
 
 /// One file being recorded. Its pointers are libobs objects this plugin
 /// holds a reference to, touched only on OBS's UI thread.
@@ -73,6 +83,15 @@ struct Iso {
 unsafe impl Send for Iso {}
 
 static ISOS: Mutex<Vec<Iso>> = Mutex::new(Vec::new());
+
+/// A separate recording to make with each of OBS's recordings (`arm_iso`):
+/// `start` without its path, and the name its file gets after OBS's.
+struct Armed {
+    start: Start,
+    name: String,
+}
+
+static ARMED: Mutex<Vec<Armed>> = Mutex::new(Vec::new());
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -94,6 +113,7 @@ fn new_data() -> Result<*mut ObsDataT, String> {
     Ok(data)
 }
 
+#[derive(Clone)]
 struct Start {
     id: String,
     source: String,
@@ -102,6 +122,11 @@ struct Start {
     path: String,
     video_encoder: String,
     audio_encoder: String,
+    /// The file's picture is no taller than this: a 4K camera recorded at
+    /// its own size wrote 49 GB an hour (2026-10-31). None: the source's size.
+    max_height: Option<u32>,
+    /// The encoder's own quality number in place of OBS's (`quality_settings`).
+    quality: Option<i64>,
 }
 
 /// The settings that make `encoder` record at OBS's own "Indistinguishable
@@ -109,17 +134,17 @@ struct Start {
 /// costs little and a busy game gets what it needs (FrameSW
 /// `recording_settings.rs`). OBS's `UpdateRecordingSettings_*`: Apple's
 /// hardware CRF at quality 70, NVIDIA's CQP 16, x264's CRF 16.
-fn quality_settings(encoder: &str, settings: *mut ObsDataT) {
+fn quality_settings(encoder: &str, quality: Option<i64>, settings: *mut ObsDataT) {
     if encoder.contains("videotoolbox") {
         obs_data::set_string(settings, "rate_control", "CRF");
         obs_data::set_string(settings, "profile", "high");
-        obs_data::set_int(settings, "quality", 70);
+        obs_data::set_int(settings, "quality", quality.unwrap_or(70));
     } else if encoder.contains("nvenc") {
         obs_data::set_string(settings, "rate_control", "CQP");
-        obs_data::set_int(settings, "cqp", 16);
+        obs_data::set_int(settings, "cqp", quality.unwrap_or(16));
     } else if encoder == "obs_x264" {
         obs_data::set_string(settings, "rate_control", "CRF");
-        obs_data::set_int(settings, "crf", 16);
+        obs_data::set_int(settings, "crf", quality.unwrap_or(16));
         obs_data::set_string(settings, "preset", "veryfast");
     } else {
         // An encoder without a known quality mode: a generous bitrate.
@@ -165,7 +190,8 @@ fn build(iso: &mut Iso, req: &Start) -> Result<(u32, u32), String> {
     if !(1..=6).contains(&req.track) {
         return Err(format!("track {} isn't one of OBS's six", req.track));
     }
-    // The picture: a view of the source, at the source's own size.
+    // The picture: a view of the source, drawn at the source's own size and
+    // scaled down by the GPU to `max_height`.
     let get_source = obs_get_source_by_name().ok_or("obs_get_source_by_name unavailable")?;
     let (Some(view_create), Some(set_source), Some(add2)) =
         (video_tap::obs_view_create(), video_tap::obs_view_set_source(), video_tap::obs_view_add2())
@@ -195,7 +221,11 @@ fn build(iso: &mut Iso, req: &Start) -> Result<(u32, u32), String> {
     }
     set_source(iso.view, 0, source);
     release(source);
-    let mut ovi = video_tap::portrait_ovi(w, h)?;
+    let (base, (w, h)) = match req.max_height.filter(|&m| m >= 16 && m < h) {
+        Some(max) => ((w, h), (((w as u64 * max as u64 / h as u64) as u32) & !1, max & !1)),
+        None => ((w, h), (w, h)),
+    };
+    let mut ovi = video_tap::scaled_ovi(base, w, h)?;
     let video = add2(iso.view, &mut ovi);
     if video.is_null() {
         return Err("obs_view_add2 returned null".into());
@@ -210,7 +240,7 @@ fn build(iso: &mut Iso, req: &Start) -> Result<(u32, u32), String> {
     let name = CString::new(format!("FrameSW separate {}", req.id)).map_err(|e| e.to_string())?;
 
     let settings = new_data()?;
-    quality_settings(&req.video_encoder, settings);
+    quality_settings(&req.video_encoder, req.quality, settings);
     let vid = CString::new(req.video_encoder.as_str()).map_err(|e| e.to_string())?;
     iso.video_enc = venc_create(vid.as_ptr(), name.as_ptr(), settings, std::ptr::null_mut());
     obs_data::release(settings);
@@ -296,11 +326,56 @@ pub fn stop_all() {
     }
 }
 
+/// The file OBS's recording is writing, while it records.
+fn recording_path() -> Option<String> {
+    let output = obs_frontend_get_recording_output()?();
+    if output.is_null() {
+        return None;
+    }
+    let settings = obs_output_get_settings().map_or(std::ptr::null_mut(), |f| f(output));
+    let path = obs_data::get_string(settings, "path").filter(|p| !p.is_empty());
+    obs_data::release(settings);
+    if let Some(release) = video_tap::obs_output_release() {
+        release(output);
+    }
+    path
+}
+
+/// `2026-10-31 17-30-00.mov` and "PiP 1": `2026-10-31 17-30-00 PiP 1.mov`.
+fn beside(recording: &str, name: &str) -> String {
+    let path = std::path::Path::new(recording);
+    let stem = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let file = match path.extension() {
+        Some(ext) => format!("{stem} {name}.{}", ext.to_string_lossy()),
+        None => format!("{stem} {name}"),
+    };
+    path.with_file_name(file).to_string_lossy().into_owned()
+}
+
+/// Starts each armed recording that isn't running, beside OBS's file. On
+/// OBS's UI thread.
+fn start_armed() {
+    let Some(recording) = recording_path() else {
+        log_line("separate recordings: OBS's recording has no file path, none started");
+        return;
+    };
+    let wanted: Vec<Start> = lock(&ARMED)
+        .iter()
+        .map(|a| Start { path: beside(&recording, &a.name), ..a.start.clone() })
+        .collect();
+    for req in wanted {
+        if !lock(&ISOS).iter().any(|i| i.id == req.id) {
+            let _ = start(&req);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
-// OBS's recording stopping, or OBS quitting
+// OBS's recording starting and stopping, or OBS quitting
 // ---------------------------------------------------------------------
 
 // enum obs_frontend_event, by position (obs-frontend-api.h).
+const EVENT_RECORDING_STARTED: c_int = 5;
 const EVENT_RECORDING_STOPPING: c_int = 6;
 
 static EVENTS_REGISTERED: Mutex<bool> = Mutex::new(false);
@@ -332,11 +407,18 @@ extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
         "iso_out::on_frontend_event",
         (),
         std::panic::AssertUnwindSafe(|| {
-            // The separate files end with OBS's own recording, whoever
-            // stopped it, and before OBS quits.
-            if matches!(event, EVENT_RECORDING_STOPPING | EVENT_EXIT | EVENT_SCENE_COLLECTION_CLEANUP) {
-                stop_all();
-                unregister_event_callback();
+            // The separate files start and end with OBS's own recording,
+            // whoever started or stopped it, and end before OBS quits. What
+            // is armed names a scene collection's sources, so it goes with it.
+            match event {
+                EVENT_RECORDING_STARTED => start_armed(),
+                EVENT_RECORDING_STOPPING => stop_all(),
+                EVENT_EXIT | EVENT_SCENE_COLLECTION_CLEANUP => {
+                    stop_all();
+                    lock(&ARMED).clear();
+                    unregister_event_callback();
+                }
+                _ => {}
             }
         }),
     );
@@ -349,6 +431,8 @@ extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
 enum UiRequest {
     Start(Start),
     Stop,
+    Arm(Armed),
+    Disarm,
 }
 
 struct UiCall {
@@ -373,6 +457,25 @@ extern "C" fn run_on_ui_thread(param: *mut c_void) {
                     stop_all();
                     Ok(())
                 }
+                UiRequest::Arm(_) => {
+                    let UiRequest::Arm(armed) = std::mem::replace(&mut call.request, UiRequest::Disarm) else {
+                        unreachable!()
+                    };
+                    let mut list = lock(&ARMED);
+                    list.retain(|a| a.start.id != armed.start.id);
+                    list.push(armed);
+                    drop(list);
+                    register_event_callback();
+                    // Armed while OBS records: it starts now, beside the file.
+                    if obs_frontend_recording_active().is_some_and(|f| f()) {
+                        start_armed();
+                    }
+                    Ok(())
+                }
+                UiRequest::Disarm => {
+                    lock(&ARMED).clear();
+                    Ok(())
+                }
             };
         }),
     );
@@ -391,7 +494,7 @@ fn run_on_ui(request: UiRequest) -> Result<(), String> {
 /// Request: `{"id", "source", "path"}` required; `"track"` (OBS's audio
 /// track, 1 to 6: 2), `"video_encoder"` and `"audio_encoder"` optional
 /// (Apple's hardware H.264 and AAC on the Mac, x264 and FFmpeg AAC
-/// elsewhere). Response: `{"ok": true}` or `{"ok": false, "error": "..."}`.
+/// elsewhere), `"max_height"` and `"quality"` optional (`Start`). Response: `{"ok": true}` or `{"ok": false, "error": "..."}`.
 pub extern "C" fn handle_start_iso(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
     ffi_guard(
         "handle_start_iso",
@@ -399,30 +502,74 @@ pub extern "C" fn handle_start_iso(request_data: *mut c_void, response_data: *mu
         std::panic::AssertUnwindSafe(|| {
             let request = obs_data::from_void(request_data);
             let response = obs_data::from_void(response_data);
-            let text = |key: &str| obs_data::get_string(request, key).filter(|s| !s.is_empty());
-            let (Some(id), Some(source), Some(path)) = (text("id"), text("source"), text("path")) else {
-                obs_data::set_bool(response, "ok", false);
-                obs_data::set_string(response, "error", "id, source and path are required");
-                return;
+            let result = match (parse_start(request), obs_data::get_string(request, "path").filter(|s| !s.is_empty())) {
+                (Some(req), Some(path)) => run_on_ui(UiRequest::Start(Start { path, ..req })),
+                _ => Err("id, source and path are required".into()),
             };
-            let req = Start {
-                id,
-                source,
-                track: obs_data::get_optional_int(request, "track").unwrap_or(2),
-                path,
-                video_encoder: text("video_encoder").unwrap_or_else(|| {
-                    if cfg!(target_os = "macos") { "com.apple.videotoolbox.videoencoder.ave.avc" } else { "obs_x264" }.to_string()
-                }),
-                audio_encoder: text("audio_encoder")
-                    .unwrap_or_else(|| if cfg!(target_os = "macos") { "CoreAudio_AAC" } else { "ffmpeg_aac" }.to_string()),
+            answer(response, result);
+        }),
+    );
+}
+
+/// `{"id", "source"}` and the optional settings (`handle_start_iso`), the
+/// path left empty. None without an id and a source.
+fn parse_start(request: *mut ObsDataT) -> Option<Start> {
+    let text = |key: &str| obs_data::get_string(request, key).filter(|s| !s.is_empty());
+    Some(Start {
+        id: text("id")?,
+        source: text("source")?,
+        track: obs_data::get_optional_int(request, "track").unwrap_or(2),
+        path: String::new(),
+        video_encoder: text("video_encoder").unwrap_or_else(|| {
+            if cfg!(target_os = "macos") { "com.apple.videotoolbox.videoencoder.ave.avc" } else { "obs_x264" }.to_string()
+        }),
+        audio_encoder: text("audio_encoder")
+            .unwrap_or_else(|| if cfg!(target_os = "macos") { "CoreAudio_AAC" } else { "ffmpeg_aac" }.to_string()),
+        max_height: obs_data::get_optional_int(request, "max_height").and_then(|m| u32::try_from(m).ok()),
+        quality: obs_data::get_optional_int(request, "quality"),
+    })
+}
+
+fn answer(response: *mut ObsDataT, result: Result<(), String>) {
+    match result {
+        Ok(()) => obs_data::set_bool(response, "ok", true),
+        Err(e) => {
+            obs_data::set_bool(response, "ok", false);
+            obs_data::set_string(response, "error", &e);
+        }
+    }
+}
+
+/// Request: `{"id", "source", "name"}` required, and `start_iso`'s optional
+/// settings. From OBS's next recording on, or now if OBS is recording, the
+/// source is recorded beside OBS's file, named after it with `name` added.
+/// An id armed again is replaced. Response: `{"ok": true}` or `{"ok": false,
+/// "error": "..."}`.
+pub extern "C" fn handle_arm_iso(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
+    ffi_guard(
+        "handle_arm_iso",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            let request = obs_data::from_void(request_data);
+            let response = obs_data::from_void(response_data);
+            let name = obs_data::get_string(request, "name").filter(|s| !s.is_empty());
+            let result = match (parse_start(request), name) {
+                (Some(start), Some(name)) => run_on_ui(UiRequest::Arm(Armed { start, name })),
+                _ => Err("id, source and name are required".into()),
             };
-            match run_on_ui(UiRequest::Start(req)) {
-                Ok(()) => obs_data::set_bool(response, "ok", true),
-                Err(e) => {
-                    obs_data::set_bool(response, "ok", false);
-                    obs_data::set_string(response, "error", &e);
-                }
-            }
+            answer(response, result);
+        }),
+    );
+}
+
+/// Request: `{}`. Nothing is armed any more; files already recording go on
+/// to the end of OBS's recording. Response: `{"ok": true}`.
+pub extern "C" fn handle_disarm_isos(_request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
+    ffi_guard(
+        "handle_disarm_isos",
+        (),
+        std::panic::AssertUnwindSafe(|| {
+            answer(obs_data::from_void(response_data), run_on_ui(UiRequest::Disarm));
         }),
     );
 }
@@ -433,14 +580,21 @@ pub extern "C" fn handle_stop_iso(_request_data: *mut c_void, response_data: *mu
         "handle_stop_iso",
         (),
         std::panic::AssertUnwindSafe(|| {
-            let response = obs_data::from_void(response_data);
-            match run_on_ui(UiRequest::Stop) {
-                Ok(()) => obs_data::set_bool(response, "ok", true),
-                Err(e) => {
-                    obs_data::set_bool(response, "ok", false);
-                    obs_data::set_string(response, "error", &e);
-                }
-            }
+            answer(obs_data::from_void(response_data), run_on_ui(UiRequest::Stop));
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A separate file sits beside OBS's, its name OBS's with the camera's
+    /// added, its kind OBS's.
+    #[test]
+    fn a_separate_file_is_named_after_obss() {
+        assert_eq!(beside("/rec/2026-10-31 17-30-00.mov", "PiP 1"), "/rec/2026-10-31 17-30-00 PiP 1.mov");
+        assert_eq!(beside("/rec/show.mkv", "Main"), "/rec/show Main.mkv");
+        assert_eq!(beside("/rec/show", "Main"), "/rec/show Main");
+    }
 }

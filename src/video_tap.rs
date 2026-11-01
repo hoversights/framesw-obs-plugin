@@ -693,6 +693,14 @@ pub(crate) fn portrait_ovi(width: u32, height: u32) -> Result<ObsVideoInfo, Stri
     Ok(ovi)
 }
 
+/// A source drawn at its own size (`base`) and scaled by the GPU to
+/// `width`x`height`: a separate recording's picture (`iso_out.rs`).
+pub(crate) fn scaled_ovi(base: (u32, u32), width: u32, height: u32) -> Result<ObsVideoInfo, String> {
+    let mut ovi = small_ovi(width, height)?;
+    (ovi.base_width, ovi.base_height) = base;
+    Ok(ovi)
+}
+
 /// The source a feed's view should show right now (a new reference, or null).
 fn wanted_source(which: Which) -> *mut ObsSourceT {
     match which {

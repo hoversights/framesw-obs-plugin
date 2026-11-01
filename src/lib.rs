@@ -2304,6 +2304,8 @@ pub extern "C" fn obs_module_post_load() {
             ("portrait_out_status", portrait_out::handle_portrait_out_status as calldata::RequestCallbackFn),
             ("start_iso", iso_out::handle_start_iso as calldata::RequestCallbackFn),
             ("stop_iso", iso_out::handle_stop_iso as calldata::RequestCallbackFn),
+            ("arm_iso", iso_out::handle_arm_iso as calldata::RequestCallbackFn),
+            ("disarm_isos", iso_out::handle_disarm_isos as calldata::RequestCallbackFn),
         ]
         .into_iter()
         .chain(input_probe::requests())
