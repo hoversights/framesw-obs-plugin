@@ -26,7 +26,9 @@ callbacks receive audio *before* the fader is applied, so this plugin
 applies the source's current volume and mute state itself, the same way
 OBS's own `obs_volmeter` does), and forwards a batched update about 10
 times a second over obs-websocket's vendor-event mechanism (registering
-as vendor `framesw`). If obs-websocket isn't installed, the plugin still
+as vendor `framesw`), the event `audio_levels`. With no sound to report it
+sends an empty one each second, so a client can tell "nothing is sounding"
+from "the plugin stopped". If obs-websocket isn't installed, the plugin still
 loads and logs locally — nothing here requires FrameSW or obs-websocket
 to be present to load cleanly.
 

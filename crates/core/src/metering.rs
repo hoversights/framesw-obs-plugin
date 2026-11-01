@@ -350,10 +350,13 @@ pub fn enumerate_list_property_diag(
     Some((out, found, raw, fmt, used_int))
 }
 
-/// The kinds whose probe is kept (`enumerate_list_property_diag`): macOS's
+/// The kinds whose probe is kept (`enumerate_list_property_diag`): the
 /// camera kinds, which select no device and open nothing when made without
-/// settings ("No device selected"). Windows' `dshow_input` is not measured.
-const KEPT_PROBE_KINDS: [&str; 2] = ["av_capture_input_v2", "av_capture_input"];
+/// settings. macOS's said "No device selected" at each make; Windows'
+/// `dshow_input` "DecodeDeviceId failed" and "Video configuration failed",
+/// 612 of OBS's 1648 log lines in 20 minutes (FrameSW's TASKS.md,
+/// 2026-10-31 M). Windows' is to be measured.
+const KEPT_PROBE_KINDS: [&str; 3] = ["av_capture_input_v2", "av_capture_input", "dshow_input"];
 
 /// The kept probes, by kind, as addresses. Made and used on the UI thread
 /// only (device lists are read there).
@@ -1221,8 +1224,16 @@ pub static VENDOR: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 pub const EMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// With nothing to report, an empty batch this often, so a client can tell
+/// a plugin with no sound to meter from one that stopped: an ended clip or
+/// a microphone that isn't there sends no audio at all, and FrameSW took
+/// the silence for a dead plugin (FrameSW's TASKS.md, 2026-10-29 F and
+/// 2026-10-31 L).
+pub const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub fn spawn_emit_loop() {
-    let handle = std::thread::spawn(|| loop {
+    let mut last_emit = std::time::Instant::now();
+    let handle = std::thread::spawn(move || loop {
         std::thread::sleep(EMIT_INTERVAL);
         if SHUTTING_DOWN.load(Ordering::Acquire) {
             return;
@@ -1241,7 +1252,7 @@ pub fn spawn_emit_loop() {
                 .map(|(name, (peak_db, active, channels_db))| SourceLevel { name, peak_db, active, channels_db })
                 .collect()
         };
-        if drained.is_empty() {
+        if drained.is_empty() && last_emit.elapsed() < HEARTBEAT_INTERVAL {
             continue;
         }
         if SHUTTING_DOWN.load(Ordering::Acquire) {
@@ -1250,6 +1261,7 @@ pub fn spawn_emit_loop() {
         let payload = obs_data::build_levels_payload(&drained);
         calldata::vendor_emit_event(vendor, "audio_levels", obs_data::as_void(payload));
         obs_data::release(payload);
+        last_emit = std::time::Instant::now();
     });
     if let Ok(mut threads) = THREADS.lock() {
         threads.push(handle);

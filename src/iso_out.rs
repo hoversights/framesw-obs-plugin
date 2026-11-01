@@ -169,8 +169,12 @@ fn recording_encoder() -> Option<String> {
 ///
 /// `smaller`: Apple's quality 60, which on a 4K camera scaled to 1080p
 /// looked the same as 70 at 2× and wrote 4.8 GB an hour, not 12.7
-/// (2026-10-31). NVIDIA's CQP 20 and x264's CRF 20 stand in for it until
-/// measured. `quality`, the encoder's own number, overrides both.
+/// (2026-10-31). NVIDIA's CQP 20, on two 4K webcams scaled to 1080p and
+/// recorded at 16 and 20 at once: 39 and 44 % less than CQP 16 (SSIM 0.994
+/// and 0.983), no difference visible at 2× (RTX 4070 Ti SUPER, 2026-10-31).
+/// The busier camera still wrote 20 GB an hour: a quality, not a ceiling.
+/// x264's CRF 20 stands in until measured. `quality`, the encoder's own
+/// number, overrides both.
 fn quality_settings(encoder: &str, quality: Option<i64>, smaller: bool, settings: *mut ObsDataT) {
     let pick = |hq: i64, small: i64| quality.unwrap_or(if smaller { small } else { hq });
     if encoder.contains("videotoolbox") {
