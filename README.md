@@ -50,13 +50,14 @@ unaffected.
 
 ## Vendor requests — the complete list
 
-The plugin registers as obs-websocket vendor `framesw` and exposes 15
+The plugin registers as obs-websocket vendor `framesw` and exposes 36
 requests. Any obs-websocket client can call them; they are not private to
 FrameSW.
 
-**Five of them change your OBS, and three more stream from it.** They are
-listed first and marked, because if you install this from a plugin directory
-you should know that before you do, not after.
+**Eleven of them change your OBS, three more stream from it, and two more
+record files from it.** They are listed first and marked, because if you
+install this from a plugin directory you should know that before you do,
+not after.
 
 ### Requests that modify OBS state
 
@@ -67,6 +68,12 @@ you should know that before you do, not after.
 | `projector_on_top` | Toggles OBS's "projectors always on top" setting, which lives in `user.ini`. Exposed here because obs-websocket has no request for it and the file cannot be safely edited on disk while OBS is running. |
 | `ndi_outputs` | Reads and sets DistroAV's Main/Preview NDI output switches, also in `user.ini`, for the same reason. No effect if DistroAV is not installed. |
 | `set_scale_filters` | Sets OBS's own **Scale Filtering** on the items of one named `scene`: the items whose ids are listed in `lanczos` (comma-separated) get Lanczos, every other item of that scene goes back to OBS's default. FrameSW sends it for its 9:16 scenes, for a picture drawn larger than its own pixels. Runs on OBS's UI thread. Exposed here because obs-websocket has no request for an item's scale filter. |
+| `monitoring_device` | Reads, or with `name` and `id` sets, OBS's **audio monitoring device** (Settings → Audio → Monitoring Device), applied at once the way OBS's own Settings dialog applies it. Always returns the list of devices. Exposed here because obs-websocket's `SetProfileParameter` writes the setting without re-opening the monitoring output. |
+| `renderer` | Reads, or with `renderer` sets, OBS's **renderer** (Settings → Advanced → Video → Renderer: "Metal", "OpenGL", "Direct3D 11"), which OBS uses from its next start. Returns the value as it stands after the write. Exposed here because `global.ini` can't be edited from outside while OBS runs: OBS rewrites it at exit. |
+| `mono` | Reads, or with `mono` sets, one input's **Downmix to Mono** (Advanced Audio Properties), read back after the change. obs-websocket has no request for it. |
+| `main_window` | Hides (`show: false`) or shows and brings to the front (`show: true`) **OBS's main window**. Projectors and dialogs keep their own visibility. FrameSW uses it to run OBS out of sight. |
+| `set_source_showing` | Makes a `source` that no scene shows render anyway (`showing: true`), the way a projector window does, without opening a window; `false` lets it go. FrameSW uses it for its browser-render check: OBS's browser source paints nothing while nothing shows it. |
+| `warm_browser_engine` | Creates a private browser source on OBS's UI thread and releases it at once, which starts OBS's browser engine so the next browser source paints straight away. Nothing it makes is kept. |
 
 ### Requests that stream
 
@@ -82,6 +89,22 @@ nowhere else: never logged, never returned.
 | `start_site_out` | One more site on encoders that are already running: `share` names a running portrait stream's `id`, or `obs` for OBS's own stream (which must be live). It has a connection of its own and no encoder, so it costs upload and no second encode. It stops with what it shares. |
 | `stop_portrait_out` | Stops the stream or the site with that `id`. |
 | `portrait_out_status` | Whether it is live or reconnecting, frames sent and dropped, bytes sent, and its last error. Read-only. |
+
+### Requests that record
+
+These **write video files** beside OBS's own recording: one source per
+file, its picture at its own size and its sound from one of OBS's six audio
+tracks, encoded on their own. They don't change OBS's settings, its scenes
+or its own recording. Which sources are on a track is set with
+obs-websocket's own `SetInputAudioTracks`; OBS mixes a track only from
+sources on Program.
+
+| Request | What it does |
+|---|---|
+| `start_iso` | Records one `source` to `path` now, with its sound from audio `track` (1–6, default 2). Optional: `max_height` (the picture scaled down to it), `quality` (the encoder's own number, in place of OBS's "Indistinguishable quality"), `video_encoder`, `audio_encoder`. One file per `id`. Stops when OBS's recording stops, at a scene collection change and when OBS quits. |
+| `arm_iso` | The same, from OBS's next recording on (or at once, if OBS is recording): when OBS's recording starts, whoever starts it, the source is recorded beside OBS's file, named after it with `name` added (`2026-10-31 17-30-00 PiP 1.mov` beside `2026-10-31 17-30-00.mov`), and stops as it stops. An `id` armed again is replaced. |
+| `disarm_isos` | Nothing is armed any more. Files already recording go on to the end of OBS's recording. |
+| `stop_iso` | Stops every file being recorded. |
 
 ### Requests that send monitor pictures
 
@@ -104,6 +127,9 @@ changed: each picture is rendered in a small mix of its own.
 | `list_video_outputs` | Returns the output list. Same motivation: obs-websocket's `GetOutputList` reads output dimensions through pointers `obs_reset_video` has freed, taking OBS down with a SIGSEGV. |
 | `tap_status` | Whether a given audio tap bus is active. |
 | `mix_status` | Whether a mix bus is active, and which sources it carries. |
+| `list_devices` | The choices of a source kind's device list (cameras, microphones, NDI sources: `kind` and `property`), read from a private source that is never added to a scene. |
+| `stream_quality` | OBS's stream as the plugin samples it ten times a second (jitter, stalls, peak against mean congestion, which a 2-second average hides), and the configured bitrate, which obs-websocket can't read in Advanced output mode. |
+| `probe_input` | Listens to one input's sound for `window_ms` (300–15000) and reports its level, its loudness, its quiet floor and how much of it was silence, as the `input_probe_result` event. Device inputs only. |
 
 ### Audio monitoring
 
