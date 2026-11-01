@@ -326,10 +326,23 @@ fn build(iso: &mut Iso, req: &Start) -> Result<(u32, u32), String> {
 }
 
 fn teardown(iso: Iso) {
+    stop_output(&iso);
+    release(iso);
+}
+
+/// Tells its output to stop: it takes no more frames, and its encoder
+/// empties on OBS's own threads.
+fn stop_output(iso: &Iso) {
     if !iso.output.is_null() {
         if let Some(stop) = video_tap::obs_output_stop() {
             stop(iso.output);
         }
+    }
+}
+
+/// After `stop_output`: the file finished and everything freed.
+fn release(iso: Iso) {
+    if !iso.output.is_null() {
         // The last reference: destroy waits for the stop and joins its
         // threads, and the file is finished, before this returns.
         if let Some(release) = video_tap::obs_output_release() {
@@ -358,15 +371,29 @@ fn teardown(iso: Iso) {
 
 /// Stops every separate recording: on FrameSW's ask, OBS quitting, or the
 /// module unloading. On OBS's UI thread, or after the frontend is gone.
+///
+/// Every one is told to stop before any is waited for. One at a time, each
+/// waited for its encoder to empty first: with the processor full (FrameSW
+/// stopping them because OBS fell behind, 2026-11-01), 20 files took 48 s
+/// here on OBS's UI thread, the encoders still taking frames meanwhile and
+/// OBS's other requests waiting up to 7.8 s.
 pub fn stop_all() {
     let isos = std::mem::take(&mut *lock(&ISOS));
-    for iso in isos {
-        let (frames, dropped) = (
-            obs_output_get_total_frames().map_or(0, |f| f(iso.output)),
-            obs_output_get_frames_dropped().map_or(0, |f| f(iso.output)),
-        );
+    let counts: Vec<(i32, i32)> = isos
+        .iter()
+        .map(|iso| {
+            (
+                obs_output_get_total_frames().map_or(0, |f| f(iso.output)),
+                obs_output_get_frames_dropped().map_or(0, |f| f(iso.output)),
+            )
+        })
+        .collect();
+    for iso in &isos {
+        stop_output(iso);
+    }
+    for (iso, (frames, dropped)) in isos.into_iter().zip(counts) {
         let (id, path) = (iso.id.clone(), iso.path.clone());
-        teardown(iso);
+        release(iso);
         log_line(&format!("separate recording '{id}' stopped: {frames} frames, {dropped} dropped, {path}"));
     }
 }
