@@ -193,6 +193,9 @@ pub enum ObsPropertiesT {}
 pub enum ObsPropertyT {}
 
 crate::resolved_fn!(obs_source_properties: extern "C" fn(*const ObsSourceT) -> *mut ObsPropertiesT);
+// A kind's properties with no source: its `get_properties(NULL)`, then its
+// defaults applied (libobs/obs-source.c). Only for `SOURCELESS_KINDS`.
+crate::resolved_fn!(obs_get_source_properties: extern "C" fn(*const c_char) -> *mut ObsPropertiesT);
 crate::resolved_fn!(obs_properties_get: extern "C" fn(*mut ObsPropertiesT, *const c_char) -> *mut ObsPropertyT);
 crate::resolved_fn!(obs_properties_destroy: extern "C" fn(*mut ObsPropertiesT));
 crate::resolved_fn!(obs_property_list_item_count: extern "C" fn(*mut ObsPropertyT) -> usize);
@@ -212,7 +215,8 @@ crate::resolved_fn!(obs_property_list_item_int: extern "C" fn(*mut ObsPropertyT,
 crate::resolved_fn!(obs_property_list_format: extern "C" fn(*mut ObsPropertyT) -> i32);
 
 /// Every `(display name, device id)` in one list property of one source
-/// kind, read through a throwaway private source.
+/// kind, read through a throwaway private source, a kept one
+/// (`KEPT_PROBE_KINDS`), or none (`SOURCELESS_KINDS`).
 ///
 /// MUST RUN ON THE OBS UI THREAD. Building properties for a capture kind
 /// enumerates OS devices, which is exactly the class of work that either
@@ -270,12 +274,16 @@ pub fn enumerate_list_property_diag(
     // nothing without a device: a microphone probe captures the default
     // input, and a live Core Audio source left to OBS's shutdown crashes it.
     let kept = settings.is_null() && KEPT_PROBE_KINDS.contains(&kind);
+    // A sound device kind lists its devices with no source made at all, so
+    // nothing is opened (`SOURCELESS_KINDS`).
+    let sourceless = settings.is_null() && SOURCELESS_KINDS.contains(&kind);
     let held = if kept {
         KEPT_PROBES.lock().ok().and_then(|probes| probes.iter().find(|(k, _)| k == kind).map(|(_, p)| *p as *mut ObsSourceT))
     } else {
         None
     };
     let source = match held {
+        _ if sourceless => std::ptr::null_mut(),
         Some(source) => source,
         None => {
             let source = obs_source_create_private(id.as_ptr(), name.as_ptr(), settings);
@@ -299,7 +307,11 @@ pub fn enumerate_list_property_diag(
     // caller so it can restore the number without having to guess from the
     // digits: a device id that merely looks numeric must stay a string.
     let mut used_int = false;
-    let props = obs_source_properties(source);
+    let props = if sourceless {
+        obs_get_source_properties()?(id.as_ptr())
+    } else {
+        obs_source_properties(source)
+    };
     if !props.is_null() {
         let prop = obs_properties_get(props, prop_key.as_ptr());
         if !prop.is_null() {
@@ -344,7 +356,7 @@ pub fn enumerate_list_property_diag(
     // point being impossible by construction: nothing between the create
     // and here can return early. A kept probe goes at OBS's exit
     // (`release_kept_probes`).
-    if !kept {
+    if !kept && !sourceless {
         obs_source_release(source);
     }
     Some((out, found, raw, fmt, used_int))
@@ -357,6 +369,16 @@ pub fn enumerate_list_property_diag(
 /// 612 of OBS's 1648 log lines in 20 minutes (FrameSW's TASKS.md,
 /// 2026-10-31 M). Windows' is to be measured.
 const KEPT_PROBE_KINDS: [&str; 3] = ["av_capture_input_v2", "av_capture_input", "dshow_input"];
+
+/// The kinds read with `obs_get_source_properties`, no source made
+/// (`enumerate_list_property_diag`): the sound devices. A probe of one
+/// opens the default input or output, and FrameSW's Hardware view asked
+/// every 4 s: on Windows a microphone opened and closed each time, 176 of
+/// OBS's log lines in 6 minutes (FrameSW's TASKS.md, 2026-11-01 S). Their
+/// properties need no source in OBS 33: WASAPI's ignore it, and Core
+/// Audio's check for NULL, its two callbacks too.
+const SOURCELESS_KINDS: [&str; 4] =
+    ["coreaudio_input_capture", "coreaudio_output_capture", "wasapi_input_capture", "wasapi_output_capture"];
 
 /// The kept probes, by kind, as addresses. Made and used on the UI thread
 /// only (device lists are read there).

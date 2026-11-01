@@ -129,7 +129,7 @@ changed: each picture is rendered in a small mix of its own.
 | `list_video_outputs` | Returns the output list. Same motivation: obs-websocket's `GetOutputList` reads output dimensions through pointers `obs_reset_video` has freed, taking OBS down with a SIGSEGV. |
 | `tap_status` | Whether a given audio tap bus is active. |
 | `mix_status` | Whether a mix bus is active, and which sources it carries. |
-| `list_devices` | The choices of a source kind's device list (cameras, microphones, NDI sources: `kind` and `property`), read from a private source that is never added to a scene. |
+| `list_devices` | The choices of a source kind's device list (cameras, microphones, NDI sources: `kind` and `property`), read from a private source that is never added to a scene, or, for sound devices, from the kind with no source at all, so no microphone is opened to list them. |
 | `stream_quality` | OBS's stream as the plugin samples it ten times a second (jitter, stalls, peak against mean congestion, which a 2-second average hides), and the configured bitrate, which obs-websocket can't read in Advanced output mode. |
 | `probe_input` | Listens to one input's sound for `window_ms` (300–15000) and reports its level, its loudness, its quiet floor and how much of it was silence, as the `input_probe_result` event. Device inputs only. |
 
