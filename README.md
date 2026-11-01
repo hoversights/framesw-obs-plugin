@@ -101,7 +101,7 @@ sources on Program.
 
 | Request | What it does |
 |---|---|
-| `start_iso` | Records one `source` to `path` now, with its sound from audio `track` (1–6, default 2). Optional: `max_height` (the picture scaled down to it), `quality` (the encoder's own number, in place of OBS's "Indistinguishable quality"), `video_encoder`, `audio_encoder`. One file per `id`. Stops when OBS's recording stops, at a scene collection change and when OBS quits. |
+| `start_iso` | Records one `source` to `path` now, with its sound from audio `track` (1–6, default 2), with the encoder OBS's own recording uses, at OBS's "Indistinguishable quality". Optional: `max_height` (the picture scaled down to it), `smaller` (a smaller file at a quality a little under that), `quality` (the encoder's own number), `video_encoder`, `audio_encoder`. One file per `id`. Stops when OBS's recording stops, at a scene collection change and when OBS quits. |
 | `arm_iso` | The same, from OBS's next recording on (or at once, if OBS is recording): when OBS's recording starts, whoever starts it, the source is recorded beside OBS's file, named after it with `name` added (`2026-10-31 17-30-00 PiP 1.mov` beside `2026-10-31 17-30-00.mov`), and stops as it stops. An `id` armed again is replaced. |
 | `disarm_isos` | Nothing is armed any more. Files already recording go on to the end of OBS's recording. |
 | `stop_iso` | Stops every file being recorded. |

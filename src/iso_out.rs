@@ -66,6 +66,9 @@ studio_mode_meters_core::resolved_fn!(obs_source_get_height: extern "C" fn(*mut 
 studio_mode_meters_core::resolved_fn!(obs_frontend_get_recording_output: extern "C" fn() -> *mut ObsOutputT);
 studio_mode_meters_core::resolved_fn!(obs_frontend_recording_active: extern "C" fn() -> bool);
 studio_mode_meters_core::resolved_fn!(obs_output_get_settings: extern "C" fn(*mut ObsOutputT) -> *mut ObsDataT);
+// The encoder an output has (borrowed) and its id, e.g. "obs_nvenc_h264_tex".
+studio_mode_meters_core::resolved_fn!(obs_output_get_video_encoder: extern "C" fn(*mut ObsOutputT) -> *mut ObsEncoderT);
+studio_mode_meters_core::resolved_fn!(obs_encoder_get_id: extern "C" fn(*mut ObsEncoderT) -> *const c_char);
 
 /// One file being recorded. Its pointers are libobs objects this plugin
 /// holds a reference to, touched only on OBS's UI thread.
@@ -120,13 +123,42 @@ struct Start {
     /// OBS's audio track, 1 to 6.
     track: i64,
     path: String,
-    video_encoder: String,
+    /// None: the encoder OBS's own recording uses (`video_encoder_for`).
+    video_encoder: Option<String>,
     audio_encoder: String,
     /// The file's picture is no taller than this: a 4K camera recorded at
     /// its own size wrote 49 GB an hour (2026-10-31). None: the source's size.
     max_height: Option<u32>,
     /// The encoder's own quality number in place of OBS's (`quality_settings`).
     quality: Option<i64>,
+    /// A smaller file at a quality a little under OBS's (`quality_settings`).
+    smaller: bool,
+}
+
+/// What `req` is encoded with: the encoder asked for, else the one OBS's own
+/// recording uses (Apple's on the Mac, NVIDIA's on a card that has one, or
+/// x264, as FrameSW set it or the user chose), else the platform's own.
+fn video_encoder_for(req: &Start) -> String {
+    req.video_encoder.clone().or_else(recording_encoder).unwrap_or_else(|| {
+        if cfg!(target_os = "macos") { "com.apple.videotoolbox.videoencoder.ave.avc" } else { "obs_x264" }.to_string()
+    })
+}
+
+/// The id of the video encoder OBS's recording output has.
+fn recording_encoder() -> Option<String> {
+    let output = obs_frontend_get_recording_output()?();
+    if output.is_null() {
+        return None;
+    }
+    let encoder = obs_output_get_video_encoder().map_or(std::ptr::null_mut(), |f| f(output));
+    let id = (!encoder.is_null())
+        .then(|| obs_encoder_get_id().map(|f| cstr(f(encoder))))
+        .flatten()
+        .filter(|id| !id.is_empty());
+    if let Some(release) = video_tap::obs_output_release() {
+        release(output);
+    }
+    id
 }
 
 /// The settings that make `encoder` record at OBS's own "Indistinguishable
@@ -134,22 +166,28 @@ struct Start {
 /// costs little and a busy game gets what it needs (FrameSW
 /// `recording_settings.rs`). OBS's `UpdateRecordingSettings_*`: Apple's
 /// hardware CRF at quality 70, NVIDIA's CQP 16, x264's CRF 16.
-fn quality_settings(encoder: &str, quality: Option<i64>, settings: *mut ObsDataT) {
+///
+/// `smaller`: Apple's quality 60, which on a 4K camera scaled to 1080p
+/// looked the same as 70 at 2× and wrote 4.8 GB an hour, not 12.7
+/// (2026-10-31). NVIDIA's CQP 20 and x264's CRF 20 stand in for it until
+/// measured. `quality`, the encoder's own number, overrides both.
+fn quality_settings(encoder: &str, quality: Option<i64>, smaller: bool, settings: *mut ObsDataT) {
+    let pick = |hq: i64, small: i64| quality.unwrap_or(if smaller { small } else { hq });
     if encoder.contains("videotoolbox") {
         obs_data::set_string(settings, "rate_control", "CRF");
         obs_data::set_string(settings, "profile", "high");
-        obs_data::set_int(settings, "quality", quality.unwrap_or(70));
+        obs_data::set_int(settings, "quality", pick(70, 60));
     } else if encoder.contains("nvenc") {
         obs_data::set_string(settings, "rate_control", "CQP");
-        obs_data::set_int(settings, "cqp", quality.unwrap_or(16));
+        obs_data::set_int(settings, "cqp", pick(16, 20));
     } else if encoder == "obs_x264" {
         obs_data::set_string(settings, "rate_control", "CRF");
-        obs_data::set_int(settings, "crf", quality.unwrap_or(16));
+        obs_data::set_int(settings, "crf", pick(16, 20));
         obs_data::set_string(settings, "preset", "veryfast");
     } else {
         // An encoder without a known quality mode: a generous bitrate.
         obs_data::set_string(settings, "rate_control", "CBR");
-        obs_data::set_int(settings, "bitrate", 20000);
+        obs_data::set_int(settings, "bitrate", if smaller { 10000 } else { 20000 });
     }
     obs_data::set_int(settings, "keyint_sec", 2);
 }
@@ -158,6 +196,8 @@ fn start(req: &Start) -> Result<(), String> {
     if lock(&ISOS).iter().any(|i| i.id == req.id) {
         return Err(format!("the separate recording '{}' is already running", req.id));
     }
+    let req = &Start { video_encoder: Some(video_encoder_for(req)), ..req.clone() };
+    let encoder = req.video_encoder.as_deref().unwrap_or_default();
     let mut iso = Iso {
         id: req.id.clone(),
         path: req.path.clone(),
@@ -170,7 +210,7 @@ fn start(req: &Start) -> Result<(), String> {
         Ok((w, h)) => {
             log_line(&format!(
                 "separate recording '{}' started: '{}' at {w}x{h}, track {}, {} to {}",
-                iso.id, req.source, req.track, req.video_encoder, iso.path
+                iso.id, req.source, req.track, encoder, iso.path
             ));
             lock(&ISOS).push(iso);
             register_event_callback();
@@ -239,13 +279,14 @@ fn build(iso: &mut Iso, req: &Start) -> Result<(u32, u32), String> {
     let get_audio = obs_get_audio().ok_or("obs_get_audio unavailable")?;
     let name = CString::new(format!("FrameSW separate {}", req.id)).map_err(|e| e.to_string())?;
 
+    let encoder = req.video_encoder.clone().unwrap_or_else(|| video_encoder_for(req));
     let settings = new_data()?;
-    quality_settings(&req.video_encoder, req.quality, settings);
-    let vid = CString::new(req.video_encoder.as_str()).map_err(|e| e.to_string())?;
+    quality_settings(&encoder, req.quality, req.smaller, settings);
+    let vid = CString::new(encoder.as_str()).map_err(|e| e.to_string())?;
     iso.video_enc = venc_create(vid.as_ptr(), name.as_ptr(), settings, std::ptr::null_mut());
     obs_data::release(settings);
     if iso.video_enc.is_null() {
-        return Err(format!("video encoder '{}' unavailable", req.video_encoder));
+        return Err(format!("video encoder '{encoder}' unavailable"));
     }
     set_video(iso.video_enc, video);
 
@@ -491,10 +532,11 @@ fn run_on_ui(request: UiRequest) -> Result<(), String> {
     call.result
 }
 
-/// Request: `{"id", "source", "path"}` required; `"track"` (OBS's audio
-/// track, 1 to 6: 2), `"video_encoder"` and `"audio_encoder"` optional
-/// (Apple's hardware H.264 and AAC on the Mac, x264 and FFmpeg AAC
-/// elsewhere), `"max_height"` and `"quality"` optional (`Start`). Response: `{"ok": true}` or `{"ok": false, "error": "..."}`.
+/// Request: `{"id", "source", "path"}` required; optional: `"track"` (OBS's
+/// audio track, 1 to 6: 2), `"max_height"`, `"smaller"`, `"quality"`,
+/// `"video_encoder"` (else the one OBS's recording uses, else Apple's H.264
+/// on the Mac and x264 elsewhere) and `"audio_encoder"` (AAC). See `Start`.
+/// Response: `{"ok": true}` or `{"ok": false, "error": "..."}`.
 pub extern "C" fn handle_start_iso(request_data: *mut c_void, response_data: *mut c_void, _priv: *mut c_void) {
     ffi_guard(
         "handle_start_iso",
@@ -520,13 +562,12 @@ fn parse_start(request: *mut ObsDataT) -> Option<Start> {
         source: text("source")?,
         track: obs_data::get_optional_int(request, "track").unwrap_or(2),
         path: String::new(),
-        video_encoder: text("video_encoder").unwrap_or_else(|| {
-            if cfg!(target_os = "macos") { "com.apple.videotoolbox.videoencoder.ave.avc" } else { "obs_x264" }.to_string()
-        }),
+        video_encoder: text("video_encoder"),
         audio_encoder: text("audio_encoder")
             .unwrap_or_else(|| if cfg!(target_os = "macos") { "CoreAudio_AAC" } else { "ffmpeg_aac" }.to_string()),
         max_height: obs_data::get_optional_int(request, "max_height").and_then(|m| u32::try_from(m).ok()),
         quality: obs_data::get_optional_int(request, "quality"),
+        smaller: obs_data::get_optional_bool(request, "smaller").unwrap_or(false),
     })
 }
 
