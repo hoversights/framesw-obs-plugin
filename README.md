@@ -76,6 +76,7 @@ not after.
 | `main_window` | Hides (`show: false`) or shows and brings to the front (`show: true`) **OBS's main window**. Projectors and dialogs keep their own visibility. FrameSW uses it to run OBS out of sight. |
 | `set_source_showing` | Makes a `source` that no scene shows render anyway (`showing: true`), the way a projector window does, without opening a window; `false` lets it go. FrameSW uses it for its browser-render check: OBS's browser source paints nothing while nothing shows it. |
 | `warm_browser_engine` | Creates a private browser source on OBS's UI thread and releases it at once, which starts OBS's browser engine so the next browser source paints straight away. Nothing it makes is kept. |
+| `stream_keyframes` | Gives OBS's own Simple-mode video encoders (`simple_video_stream`, and `simple_video_recording`, which the replay buffer uses) a **keyframe every 2 seconds**, only where the interval is still the encoder's default and the encoder isn't running. Runs on OBS's UI thread. FrameSW sends it before each start: OBS's Simple mode sets no keyframe interval for a custom server, so NVENC and x264 keep 250 frames (8 s at 30 fps), where sites ask for 2 s. |
 
 ### Requests that stream
 

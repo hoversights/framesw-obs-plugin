@@ -53,6 +53,7 @@ use std::sync::atomic::Ordering;
 mod audio_tap;
 mod input_probe;
 mod iso_out;
+mod keyframes;
 mod loudness;
 mod main_window;
 mod ndi_ffi;
@@ -2310,6 +2311,7 @@ pub extern "C" fn obs_module_post_load() {
         .into_iter()
         .chain(input_probe::requests())
         .chain(main_window::requests())
+        .chain(keyframes::requests())
         .chain(scale_filter::requests())
         {
             if calldata::register_request(vendor, request_type, callback) {
