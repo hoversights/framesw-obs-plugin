@@ -414,14 +414,19 @@ fn recording_path() -> Option<String> {
 }
 
 /// `2026-10-31 17-30-00.mov` and "PiP 1": `2026-10-31 17-30-00 PiP 1.mov`.
+/// The folder stays exactly as OBS wrote it, its separators included:
+/// `Path::with_file_name` joined with the platform's own, a `\` after OBS's
+/// `/` on Windows (`/rec\2026-10-31 17-30-00 PiP 1.mov`, the plugin's
+/// Windows CI, 2026-11-01).
 fn beside(recording: &str, name: &str) -> String {
-    let path = std::path::Path::new(recording);
+    let cut = recording.rfind(['/', '\\']).map_or(0, |i| i + 1);
+    let (folder, file) = recording.split_at(cut);
+    let path = std::path::Path::new(file);
     let stem = path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-    let file = match path.extension() {
-        Some(ext) => format!("{stem} {name}.{}", ext.to_string_lossy()),
-        None => format!("{stem} {name}"),
-    };
-    path.with_file_name(file).to_string_lossy().into_owned()
+    match path.extension() {
+        Some(ext) => format!("{folder}{stem} {name}.{}", ext.to_string_lossy()),
+        None => format!("{folder}{stem} {name}"),
+    }
 }
 
 /// Starts each armed recording that isn't running, beside OBS's file. On
@@ -668,5 +673,8 @@ mod tests {
         assert_eq!(beside("/rec/2026-10-31 17-30-00.mov", "PiP 1"), "/rec/2026-10-31 17-30-00 PiP 1.mov");
         assert_eq!(beside("/rec/show.mkv", "Main"), "/rec/show Main.mkv");
         assert_eq!(beside("/rec/show", "Main"), "/rec/show Main");
+        // Windows: OBS's folder as it wrote it, whichever separator.
+        assert_eq!(beside("C:/rec/show.mkv", "Main"), "C:/rec/show Main.mkv");
+        assert_eq!(beside(r"C:\rec\show.mkv", "Main"), r"C:\rec\show Main.mkv");
     }
 }
